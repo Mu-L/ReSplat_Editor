@@ -4,7 +4,10 @@ import { Events } from '../events';
 import { ShortcutManager } from '../shortcut-manager';
 import { localize, formatTooltipWithShortcut } from './localization';
 import flyCameraSvg from './svg/fly-camera.svg';
+import translateSvg from './svg/move.svg';
 import orbitCameraSvg from './svg/orbit-camera.svg';
+import rotateSvg from './svg/rotate.svg';
+import scaleSvg from './svg/scale.svg';
 import { Tooltips } from './tooltips';
 
 const createSvg = (svgString: string) => {
@@ -41,6 +44,30 @@ class CameraModeSwitch extends Container {
         this.append(orbitMode);
         this.append(flyMode);
 
+        const transformTools = new Container({
+            id: 'transform-tool-switch'
+        });
+        const translate = new Button({
+            id: 'transform-tool-translate',
+            class: ['camera-mode-btn', 'transform-tool-btn']
+        });
+        const rotate = new Button({
+            id: 'transform-tool-rotate',
+            class: ['camera-mode-btn', 'transform-tool-btn']
+        });
+        const scale = new Button({
+            id: 'transform-tool-scale',
+            class: ['camera-mode-btn', 'transform-tool-btn']
+        });
+
+        translate.dom.appendChild(createSvg(translateSvg));
+        rotate.dom.appendChild(createSvg(rotateSvg));
+        scale.dom.appendChild(createSvg(scaleSvg));
+        transformTools.append(translate);
+        transformTools.append(rotate);
+        transformTools.append(scale);
+        this.append(transformTools);
+
         const shortcutManager: ShortcutManager = events.invoke('shortcutManager');
         const tooltip = (localeKey: string, shortcutId?: string) => {
             const text = localize(localeKey);
@@ -55,15 +82,32 @@ class CameraModeSwitch extends Container {
 
         tooltips.register(orbitMode, tooltip('tooltip.right-toolbar.orbit-camera', 'camera.toggleControlMode'), 'bottom');
         tooltips.register(flyMode, tooltip('tooltip.right-toolbar.fly-camera', 'camera.toggleControlMode'), 'bottom');
+        tooltips.register(translate, tooltip('tooltip.left-toolbar.translate', 'tool.move'), 'bottom');
+        tooltips.register(rotate, tooltip('tooltip.left-toolbar.rotate', 'tool.rotate'), 'bottom');
+        tooltips.register(scale, tooltip('tooltip.left-toolbar.scale', 'tool.scale'), 'bottom');
+
+        translate.on('click', () => events.fire('tool.move'));
+        rotate.on('click', () => events.fire('tool.rotate'));
+        scale.on('click', () => events.fire('tool.scale'));
+
+        events.on('tool.activated', (toolName: string) => {
+            translate.class[toolName === 'move' ? 'add' : 'remove']('active');
+            rotate.class[toolName === 'rotate' ? 'add' : 'remove']('active');
+            scale.class[toolName === 'scale' ? 'add' : 'remove']('active');
+        });
+
+        events.on('mode.changed', (mode: 'edit' | 'paint') => {
+            const painting = mode === 'paint';
+            transformTools.hidden = painting;
+            this.dom.classList.toggle('transform-tools-hidden', painting);
+        });
 
         orbitMode.on('click', () => {
             events.fire('camera.setControlMode', 'orbit');
-            // eslint-disable-next-line no-use-before-define
             showSpeedPopup();
         });
         flyMode.on('click', () => {
             events.fire('camera.setControlMode', 'fly');
-            // eslint-disable-next-line no-use-before-define
             showSpeedPopup();
         });
 

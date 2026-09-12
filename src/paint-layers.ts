@@ -3,6 +3,7 @@ import { DecalSubdividePaintOp, EditOp, PaintEraseOp, PaintLayerOp, PaintStrokeO
 import { Events } from './events';
 import {
     accumulatePaintLayerRgba,
+    compositePaintAlpha,
     compositePaintLayerRgb,
     erasePaintLayerRgba,
     isPaintBlendMode,
@@ -102,6 +103,9 @@ class PaintLayerManager {
         events.function('paint.layers.deserialize', (data: PaintLayersDocument | null | undefined, splats: Splat[]) => this.deserialize(data, splats));
         events.function('paint.layers.finishRestore', () => this.finishRestore());
         events.function('paint.layers.recompose', () => this.recompose());
+        events.function('paint.layers.erasePreview', (splat: Splat, layerId = this.getActiveLayerId(splat)) => (
+            this.createErasePreview(splat, layerId)
+        ));
         events.function('paint.layers.dirty', () => this.dirty);
 
         events.on('paint.layers.create', () => this.createLayer());
@@ -490,12 +494,96 @@ class PaintLayerManager {
         }
     }
 
+    private createErasePreview(splat: Splat, erasedLayerId: string) {
+        const baseline = this.baselines.get(splat);
+        if (!baseline || baseline.colors.size === 0) {
+            return {
+                indices: new Uint32Array(0),
+                colors: new Float32Array(0),
+                shMask: new Uint8Array(0)
+            };
+        }
+
+        const layerColorWork: LayerColorWork = new Map();
+        for (const operation of this.operations) {
+            const layer = this.getLayer(operation.layerId);
+            if (!this.operationApplied.get(operation) || !layer || layer.deleted || !layer.visible ||
+                layer.id === erasedLayerId) continue;
+            const inner = operation.op;
+            if (inner instanceof PaintStrokeOp && inner.splat === splat) {
+                this.composeLayerColors(layerColorWork, layer.id, splat, inner.indices, inner.colors, inner.after);
+            } else if (inner instanceof PaintEraseOp && inner.splat === splat) {
+                this.eraseLayerColors(layerColorWork, layer.id, splat, inner.indices, inner.strengths);
+            } else if (inner instanceof DecalSubdividePaintOp && inner.splat === splat) {
+                this.composeLayerColors(
+                    layerColorWork,
+                    layer.id,
+                    splat,
+                    inner.paintIndices,
+                    inner.paintColors,
+                    inner.afterPaint
+                );
+            }
+        }
+
+        const output = new Map(Array.from(baseline.colors, ([index, color]) => [index, [...color] as ColorValue]));
+        const paintShMask = new Map(Array.from(baseline.colors.keys(), index => [index, 0]));
+        for (let layerIndex = this.layers.length - 1; layerIndex >= 0; --layerIndex) {
+            const layer = this.layers[layerIndex];
+            if (layer.deleted || !layer.visible || layer.opacity <= 0 || layer.id === erasedLayerId) continue;
+            const values = layerColorWork.get(layer.id)?.get(splat);
+            if (!values) continue;
+
+            for (const [index, premultiplied] of values) {
+                const backdropDc = output.get(index);
+                const alpha = premultiplied[3];
+                if (!backdropDc || alpha <= 0) continue;
+                const source: ColorValue = [
+                    premultiplied[0] / alpha,
+                    premultiplied[1] / alpha,
+                    premultiplied[2] / alpha
+                ];
+                const composited = compositePaintLayerRgb([
+                    dcDecode(backdropDc[0]),
+                    dcDecode(backdropDc[1]),
+                    dcDecode(backdropDc[2])
+                ], source, alpha, layer.blendMode, layer.opacity);
+                output.set(index, [
+                    dcEncode(composited[0]),
+                    dcEncode(composited[1]),
+                    dcEncode(composited[2])
+                ]);
+                paintShMask.set(index, compositePaintAlpha(
+                    paintShMask.get(index) ?? 0,
+                    alpha,
+                    layer.opacity
+                ));
+            }
+        }
+
+        const indices = new Uint32Array(output.size);
+        const colors = new Float32Array(output.size * 3);
+        const shMask = new Uint8Array(output.size);
+        let write = 0;
+        for (const [index, color] of output) {
+            indices[write] = index;
+            colors[write * 3] = clamp01(dcDecode(color[0]));
+            colors[write * 3 + 1] = clamp01(dcDecode(color[1]));
+            colors[write * 3 + 2] = clamp01(dcDecode(color[2]));
+            shMask[write] = Math.round(clamp01(paintShMask.get(index) ?? 0) * 255);
+            write++;
+        }
+        return { indices, colors, shMask };
+    }
+
     private async recompose() {
         const colorWork = new Map<Splat, Map<number, ColorValue>>();
+        const paintShMaskWork = new Map<Splat, Map<number, number>>();
         const layerColorWork: LayerColorWork = new Map();
         const deletedWork = new Map<Splat, Map<number, number>>();
         for (const [splat, baseline] of this.baselines) {
             colorWork.set(splat, new Map(Array.from(baseline.colors, ([index, color]) => [index, [...color] as ColorValue])));
+            paintShMaskWork.set(splat, new Map(Array.from(baseline.colors.keys(), index => [index, 0])));
             deletedWork.set(splat, new Map(baseline.deleted));
         }
 
@@ -544,7 +632,8 @@ class PaintLayerManager {
 
             for (const [splat, values] of splatWork) {
                 const output = colorWork.get(splat);
-                if (!output) continue;
+                const paintShMask = paintShMaskWork.get(splat);
+                if (!output || !paintShMask) continue;
                 for (const [index, premultiplied] of values) {
                     const backdropDc = output.get(index);
                     const alpha = premultiplied[3];
@@ -564,6 +653,11 @@ class PaintLayerManager {
                         dcEncode(composited[1]),
                         dcEncode(composited[2])
                     ]);
+                    paintShMask.set(index, compositePaintAlpha(
+                        paintShMask.get(index) ?? 0,
+                        alpha,
+                        layer.opacity
+                    ));
                 }
             }
         }
@@ -572,15 +666,19 @@ class PaintLayerManager {
             if (!splat.scene || values.size === 0) continue;
             const indices = new Uint32Array(values.size);
             const colors = new Float32Array(values.size * 3);
+            const paintShMask = new Uint8Array(values.size);
+            const maskValues = paintShMaskWork.get(splat);
             let write = 0;
             for (const [index, color] of values) {
                 indices[write] = index;
                 colors[write * 3] = color[0];
                 colors[write * 3 + 1] = color[1];
                 colors[write * 3 + 2] = color[2];
+                paintShMask[write] = Math.round(clamp01(maskValues?.get(index) ?? 0) * 255);
                 write++;
             }
             splat.applyPaintValues(indices, colors);
+            splat.applyPaintShMaskValues(indices, paintShMask);
         }
 
         for (const [splat, values] of deletedWork) {

@@ -692,7 +692,13 @@ class Camera extends Element {
     }
 
     // intersect the scene at the given normalized screen coordinate (0-1 range) using depth picking
-    async intersect(x: number, y: number, alphaThreshold = 0, candidates?: readonly Splat[]) {
+    async intersect(
+        x: number,
+        y: number,
+        alphaThreshold = 0,
+        candidates?: readonly Splat[],
+        retainClosestDepthMap = false
+    ) {
         const { scene } = this;
         const splats = candidates ?? scene.getElementsByType(ElementType.splat) as Splat[];
 
@@ -716,6 +722,15 @@ class Camera extends Element {
             return null;
         }
 
+        // The depth target reuses the main color texture. readDepth() is
+        // asynchronous, so a normal frame may overwrite that texture while the
+        // GPU readback is pending. Painting consumes the complete depth map
+        // immediately after this call; redraw it synchronously after every
+        // await, even when the closest Splat was the last one tested.
+        if (retainClosestDepthMap) {
+            this.picker.prepareDepth(closestSplat, alphaThreshold);
+        }
+
         // Convert normalized depth to linear depth
         const linearDepth = closestDepth * (this.far - this.near) + this.near;
 
@@ -737,7 +752,8 @@ class Camera extends Element {
         return {
             splat: closestSplat,
             position: position,
-            distance: t
+            distance: t,
+            frontDepthTexture: retainClosestDepthMap ? this.picker.depthTexture : null
         };
     }
 

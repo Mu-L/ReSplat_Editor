@@ -6,13 +6,12 @@ import {
     GSPLAT_STREAM_INSTANCE,
     GSplatProcessor,
     GSplatResource,
+    Mat4,
     PIXELFORMAT_RGBA8,
-    Texture,
-    Vec3
+    Texture
 } from 'playcanvas';
 
 import { dcDecode, dcEncode } from './color-grade';
-import { mergeQueuedPaintSample } from './paint-pick';
 import type { Splat } from './splat';
 
 const PAINT_STREAM = 'paintColor';
@@ -31,9 +30,14 @@ const paintBlendState = new BlendState(
 );
 
 const processGLSL = /* glsl */ `
-uniform vec4 uPaintSphere;
+uniform vec4 uPaintScreenCircle;
+uniform vec4 uPaintViewportDepth;
 uniform vec4 uPaintColor;
 uniform float uPaintHardness;
+uniform float uPaintDepthUvFlip;
+uniform mat4 uPaintModelView;
+uniform mat4 uPaintModelViewProjection;
+uniform highp sampler2D uPaintFrontDepth;
 uniform highp sampler2D splatState;
 uniform highp sampler2D soloMask;
 uniform highp usampler2D splatTransform;
@@ -56,6 +60,51 @@ vec3 getPaintCenter() {
     return (transpose(transform) * vec4(center, 1.0)).xyz;
 }
 
+float getScreenBrushDistance(vec3 center) {
+    vec4 clip = uPaintModelViewProjection * vec4(center, 1.0);
+    if (clip.w <= 0.0) {
+        return -1.0;
+    }
+
+    vec2 screen = vec2(
+        clip.x / clip.w * 0.5 + 0.5,
+        1.0 - (clip.y / clip.w * 0.5 + 0.5)
+    );
+    if (any(lessThan(screen, vec2(0.0))) || any(greaterThanEqual(screen, vec2(1.0)))) {
+        return -1.0;
+    }
+
+    float distancePixels = length((screen - uPaintScreenCircle.xy) * uPaintViewportDepth.xy);
+    if (distancePixels >= uPaintScreenCircle.z) {
+        return -1.0;
+    }
+
+    ivec2 depthSize = textureSize(uPaintFrontDepth, 0);
+    vec2 depthUv = screen;
+    if (uPaintDepthUvFlip > 0.5) {
+        depthUv.y = 1.0 - depthUv.y;
+    }
+    ivec2 depthPixel = clamp(
+        ivec2(floor(depthUv * vec2(depthSize))),
+        ivec2(0),
+        depthSize - ivec2(1)
+    );
+    vec4 packedFrontDepth = texelFetch(uPaintFrontDepth, depthPixel, 0);
+    float frontAlpha = 1.0 - packedFrontDepth.a;
+    if (frontAlpha < 1e-6) {
+        return -1.0;
+    }
+
+    float frontNormalizedDepth = clamp(packedFrontDepth.r / frontAlpha, 0.0, 1.0);
+    float frontLinearDepth = mix(uPaintViewportDepth.z, uPaintViewportDepth.w, frontNormalizedDepth);
+    float linearDepth = -(uPaintModelView * vec4(center, 1.0)).z;
+    if (linearDepth - frontLinearDepth > uPaintScreenCircle.w) {
+        return -1.0;
+    }
+
+    return distancePixels;
+}
+
 void process() {
     vec4 result = vec4(0.0);
     uint vertexState = uint(texelFetch(splatState, splat.uv, 0).r * 255.0 + 0.5) & 7u;
@@ -64,12 +113,13 @@ void process() {
 
     if (editable && visible) {
         vec3 center = getPaintCenter();
-        float distanceToCenter = distance(center, uPaintSphere.xyz);
-        if (distanceToCenter < uPaintSphere.w) {
+        float radius = uPaintScreenCircle.z;
+        float distanceToCenter = getScreenBrushDistance(center);
+        if (distanceToCenter >= 0.0 && distanceToCenter < radius) {
             float hardness = clamp(uPaintHardness, 0.0, 1.0);
             float falloff = hardness >= 0.999
                 ? 1.0
-                : 1.0 - smoothstep(uPaintSphere.w * hardness, uPaintSphere.w, distanceToCenter);
+                : 1.0 - smoothstep(radius * hardness, radius, distanceToCenter);
             result = uPaintColor;
             result.a *= falloff;
         }
@@ -86,11 +136,47 @@ type PaintSettings = {
     radius: number;
 };
 
+type ScreenPaintSettings = Omit<PaintSettings, 'radius'> & {
+    x: number;
+    y: number;
+    radiusPixels: number;
+    viewportWidth: number;
+    viewportHeight: number;
+    depthTolerance: number;
+    nearClip: number;
+    farClip: number;
+    frontDepthTexture: Texture;
+    viewMatrix: Mat4;
+    viewProjectionMatrix: Mat4;
+};
+
 type PaintStrokeDelta = {
     indices: Uint32Array;
     before: Float32Array;
     after: Float32Array;
     colors: Float32Array;
+    beforeShMask: Uint8Array;
+    afterShMask: Uint8Array;
+};
+
+type PaintCommitOptions = {
+    collectDiagnostic: true;
+};
+
+type PaintCommitDiagnostic = {
+    sphereIndices: Uint32Array;
+    frontVisibleIndices: Uint32Array;
+    paintThroughIndices: Uint32Array;
+    timings: {
+        gpuReadbackMs: number;
+        commitCpuMs: number;
+        totalCommitMs: number;
+    };
+};
+
+type PaintDiagnosticCommitResult = {
+    delta: PaintStrokeDelta | null;
+    diagnostic: PaintCommitDiagnostic;
 };
 
 type PaintEraseDelta = {
@@ -103,14 +189,30 @@ type PaintSampleData = {
     colors: Float32Array;
 };
 
+type PaintErasePreview = {
+    indices: Uint32Array;
+    colors: Float32Array;
+    shMask: Uint8Array;
+};
+
+type PaintPreviewMode = 'paint' | 'erase-color' | 'erase-opacity';
+
+type PaintEraseCommitOptions = {
+    keepPreview?: boolean;
+};
+
 class SplatPaintRuntime {
     readonly splat: Splat;
     readonly texture: Texture;
+    readonly eraseTargetTexture: Texture;
 
     private processor: GSplatProcessor;
-    private sphere = new Float32Array(4);
+    private screenCircle = new Float32Array(4);
+    private viewportDepth = new Float32Array(4);
     private color = new Float32Array(4);
-    private queuedSamples = new Map<number, Float32Array>();
+    private modelView = new Mat4();
+    private modelViewProjection = new Mat4();
+    private previewMode: PaintPreviewMode = 'paint';
     private previewEnabled = true;
     private destroyed = false;
 
@@ -139,6 +241,16 @@ class SplatPaintRuntime {
             PIXELFORMAT_RGBA8
         );
         this.texture = texture;
+        this.eraseTargetTexture = Texture.createDataTexture2D(
+            resource.device,
+            `paintEraseTarget-${splat.uid}`,
+            width,
+            height,
+            PIXELFORMAT_RGBA8
+        );
+        const eraseTargetData = this.eraseTargetTexture.lock() as Uint8Array;
+        eraseTargetData.fill(0);
+        this.eraseTargetTexture.unlock();
         this.clear();
 
         // GSplatProcessor resolves instance streams through a component binding.
@@ -161,32 +273,95 @@ class SplatPaintRuntime {
         this.processor.setParameter('soloMask', splat.soloMaskTexture);
         this.processor.setParameter('splatTransform', splat.transformTexture);
         this.processor.setParameter('transformPalette', splat.transformPalette.texture);
-        this.processor.setParameter('uPaintSphere', this.sphere);
+        this.processor.setParameter('uPaintScreenCircle', this.screenCircle);
+        this.processor.setParameter('uPaintViewportDepth', this.viewportDepth);
         this.processor.setParameter('uPaintColor', this.color);
         this.processor.setParameter('uPaintHardness', 1);
+        this.processor.setParameter('uPaintDepthUvFlip', resource.device.isWebGPU ? 0 : 1);
+        this.processor.setParameter('uPaintModelView', this.modelView.data);
+        this.processor.setParameter('uPaintModelViewProjection', this.modelViewProjection.data);
+        this.processor.setParameter('uPaintFrontDepth', texture);
 
-        splat.setPaintTexture(texture);
+        this.bindPreview();
+    }
+
+    private bindPreview() {
+        const mode = this.previewMode === 'paint' ? 0 : (this.previewMode === 'erase-color' ? 1 : 2);
+        this.splat.setPaintTexture(
+            this.previewEnabled ? this.texture : null,
+            mode,
+            mode === 1 ? this.eraseTargetTexture : null
+        );
     }
 
     setPreviewEnabled(enabled: boolean) {
         if (this.destroyed || this.previewEnabled === enabled) return;
         this.previewEnabled = enabled;
-        this.splat.setPaintTexture(enabled ? this.texture : null);
+        this.bindPreview();
         if (this.splat.scene) this.splat.scene.forceRender = true;
     }
 
-    paintSphere(center: Vec3, settings: PaintSettings) {
+    setPreviewMode(mode: PaintPreviewMode) {
+        if (this.destroyed || this.previewMode === mode) return;
+        this.previewMode = mode;
+        this.bindPreview();
+    }
+
+    setErasePreviewTarget(preview: PaintErasePreview | null | undefined) {
+        if (this.destroyed) return;
+
+        const count = this.splat.splatData.numSplats;
+        const dc0 = this.splat.splatData.getProp('f_dc_0') as Float32Array;
+        const dc1 = this.splat.splatData.getProp('f_dc_1') as Float32Array;
+        const dc2 = this.splat.splatData.getProp('f_dc_2') as Float32Array;
+        const data = this.eraseTargetTexture.lock() as Uint8Array;
+        data.fill(0);
+        for (let index = 0; index < count; ++index) {
+            const pixel = index * 4;
+            data[pixel] = Math.round(Math.min(1, Math.max(0, dcDecode(dc0[index]))) * 255);
+            data[pixel + 1] = Math.round(Math.min(1, Math.max(0, dcDecode(dc1[index]))) * 255);
+            data[pixel + 2] = Math.round(Math.min(1, Math.max(0, dcDecode(dc2[index]))) * 255);
+            data[pixel + 3] = this.splat.paintShMaskData[index];
+        }
+        if (preview) {
+            if (preview.colors.length !== preview.indices.length * 3 || preview.shMask.length !== preview.indices.length) {
+                this.eraseTargetTexture.unlock();
+                throw new Error('Paint erase preview data does not match its Gaussian indices.');
+            }
+            for (let i = 0; i < preview.indices.length; ++i) {
+                const index = preview.indices[i];
+                if (index >= count) continue;
+                const pixel = index * 4;
+                const value = i * 3;
+                data[pixel] = Math.round(Math.min(1, Math.max(0, preview.colors[value])) * 255);
+                data[pixel + 1] = Math.round(Math.min(1, Math.max(0, preview.colors[value + 1])) * 255);
+                data[pixel + 2] = Math.round(Math.min(1, Math.max(0, preview.colors[value + 2])) * 255);
+                data[pixel + 3] = preview.shMask[i];
+            }
+        }
+        this.eraseTargetTexture.unlock();
+        if (this.splat.scene) this.splat.scene.forceRender = true;
+    }
+
+    paintScreenCircle(settings: ScreenPaintSettings) {
         if (this.destroyed || !this.splat.scene) return;
 
-        this.sphere[0] = center.x;
-        this.sphere[1] = center.y;
-        this.sphere[2] = center.z;
-        this.sphere[3] = Math.max(settings.radius, 1e-8);
+        this.screenCircle[0] = Math.min(1, Math.max(0, settings.x));
+        this.screenCircle[1] = Math.min(1, Math.max(0, settings.y));
+        this.screenCircle[2] = Math.max(settings.radiusPixels, 1e-8);
+        this.screenCircle[3] = Math.max(settings.depthTolerance, 0);
+        this.viewportDepth[0] = Math.max(settings.viewportWidth, 1);
+        this.viewportDepth[1] = Math.max(settings.viewportHeight, 1);
+        this.viewportDepth[2] = settings.nearClip;
+        this.viewportDepth[3] = settings.farClip;
         this.color[0] = settings.color.r;
         this.color[1] = settings.color.g;
         this.color[2] = settings.color.b;
         this.color[3] = Math.min(1, Math.max(0, settings.strength));
+        this.modelView.mul2(settings.viewMatrix, this.splat.worldTransform);
+        this.modelViewProjection.mul2(settings.viewProjectionMatrix, this.splat.worldTransform);
         this.processor.setParameter('uPaintHardness', Math.min(1, Math.max(0, settings.hardness)));
+        this.processor.setParameter('uPaintFrontDepth', settings.frontDepthTexture);
 
         this.processor.process();
         this.splat.scene.forceRender = true;
@@ -213,44 +388,82 @@ class SplatPaintRuntime {
         this.splat.scene.forceRender = true;
     }
 
-    // Brush paint-through IDs come from asynchronous screen-space picking.
-    // Defer them until commit so CPU texture writes cannot race the processor's
-    // GPU sphere writes. MAX-strength semantics match paintBlendState.
-    queuePaintSample(splatIndex: number, color: Color, strength: number) {
-        if (this.destroyed || !this.splat.scene || splatIndex < 0 || splatIndex >= this.splat.splatData.numSplats) return;
-
-        const alpha = Math.min(1, Math.max(0, strength));
-        const queued = this.queuedSamples.get(splatIndex);
-        if (queued && queued[3] >= alpha) return;
-        this.queuedSamples.set(splatIndex, new Float32Array([color.r, color.g, color.b, alpha]));
-    }
-
-    private async readStrokePixels() {
+    private async readStrokePixels(collectDiagnostic = false) {
         if (this.destroyed || !this.splat.scene) {
             return null;
         }
 
         const resource = this.splat.asset.resource as GSplatResource;
         const { x: width, y: height } = resource.textureDimensions;
+        const readbackStart = performance.now();
         const pixels = await this.texture.read(0, 0, width, height, {
             immediate: true
         }) as Uint8Array;
+        const gpuReadbackMs = performance.now() - readbackStart;
 
         if (this.destroyed || !this.splat.scene) {
             return null;
         }
 
         const count = this.splat.splatData.numSplats;
-        for (const [splatIndex, sample] of this.queuedSamples) {
-            if (splatIndex >= count) continue;
-            mergeQueuedPaintSample(pixels, splatIndex, sample);
+        let sphereIndices = new Uint32Array(0);
+        const frontVisibleIndices = new Uint32Array(0);
+        const paintThroughIndices = new Uint32Array(0);
+        if (collectDiagnostic) {
+            let sphereCount = 0;
+            for (let index = 0; index < count; index++) {
+                if (pixels[index * 4 + 3] !== 0) sphereCount++;
+            }
+            sphereIndices = new Uint32Array(sphereCount);
+            let write = 0;
+            for (let index = 0; index < count; index++) {
+                if (pixels[index * 4 + 3] !== 0) sphereIndices[write++] = index;
+            }
         }
-        return pixels;
+        return { pixels, sphereIndices, frontVisibleIndices, paintThroughIndices, gpuReadbackMs };
     }
 
-    async commit(): Promise<PaintStrokeDelta | null> {
-        const pixels = await this.readStrokePixels();
-        if (!pixels) return null;
+    async commit(): Promise<PaintStrokeDelta | null>;
+    async commit(options: PaintCommitOptions): Promise<PaintDiagnosticCommitResult>;
+    async commit(options?: PaintCommitOptions): Promise<PaintStrokeDelta | PaintDiagnosticCommitResult | null> {
+        const totalStart = performance.now();
+        const collectDiagnostic = options?.collectDiagnostic === true;
+        const read = await this.readStrokePixels(collectDiagnostic);
+        if (!read) {
+            if (!collectDiagnostic) return null;
+            return {
+                delta: null,
+                diagnostic: {
+                    sphereIndices: new Uint32Array(0),
+                    frontVisibleIndices: new Uint32Array(0),
+                    paintThroughIndices: new Uint32Array(0),
+                    timings: {
+                        gpuReadbackMs: 0,
+                        commitCpuMs: 0,
+                        totalCommitMs: performance.now() - totalStart
+                    }
+                }
+            };
+        }
+        const { pixels, sphereIndices, frontVisibleIndices, paintThroughIndices, gpuReadbackMs } = read;
+
+        const complete = (delta: PaintStrokeDelta | null): PaintStrokeDelta | PaintDiagnosticCommitResult | null => {
+            if (!collectDiagnostic) return delta;
+            const totalCommitMs = performance.now() - totalStart;
+            return {
+                delta,
+                diagnostic: {
+                    sphereIndices,
+                    frontVisibleIndices,
+                    paintThroughIndices,
+                    timings: {
+                        gpuReadbackMs,
+                        commitCpuMs: Math.max(0, totalCommitMs - gpuReadbackMs),
+                        totalCommitMs
+                    }
+                }
+            };
+        };
 
         const count = this.splat.splatData.numSplats;
 
@@ -261,13 +474,15 @@ class SplatPaintRuntime {
 
         if (changed === 0) {
             this.clear();
-            return null;
+            return complete(null);
         }
 
         const indices = new Uint32Array(changed);
         const before = new Float32Array(changed * 3);
         const after = new Float32Array(changed * 3);
         const colors = new Float32Array(changed * 4);
+        const beforeShMask = new Uint8Array(changed);
+        const afterShMask = new Uint8Array(changed);
         const dc0 = this.splat.splatData.getProp('f_dc_0') as Float32Array;
         const dc1 = this.splat.splatData.getProp('f_dc_1') as Float32Array;
         const dc2 = this.splat.splatData.getProp('f_dc_2') as Float32Array;
@@ -293,17 +508,21 @@ class SplatPaintRuntime {
             colors[color + 1] = pixels[pixel + 1] / 255;
             colors[color + 2] = pixels[pixel + 2] / 255;
             colors[color + 3] = strength;
+            beforeShMask[dst] = this.splat.paintShMaskData[i];
+            afterShMask[dst] = Math.round((strength + beforeShMask[dst] / 255 * invStrength) * 255);
             dst++;
         }
 
         this.splat.applyPaintValues(indices, after);
+        this.splat.applyPaintShMaskValues(indices, afterShMask);
         this.clear();
-        return { indices, before, after, colors };
+        return complete({ indices, before, after, colors, beforeShMask, afterShMask });
     }
 
-    async commitErase(): Promise<PaintEraseDelta | null> {
-        const pixels = await this.readStrokePixels();
-        if (!pixels) return null;
+    async commitErase(options: PaintEraseCommitOptions = {}): Promise<PaintEraseDelta | null> {
+        const read = await this.readStrokePixels();
+        if (!read) return null;
+        const { pixels } = read;
 
         const count = this.splat.splatData.numSplats;
         let changed = 0;
@@ -312,7 +531,7 @@ class SplatPaintRuntime {
         }
 
         if (changed === 0) {
-            this.clear();
+            if (!options.keepPreview) this.clear();
             return null;
         }
 
@@ -327,13 +546,12 @@ class SplatPaintRuntime {
             dst++;
         }
 
-        this.clear();
+        if (!options.keepPreview) this.clear();
         return { indices, strengths };
     }
 
     clear() {
         if (this.destroyed) return;
-        this.queuedSamples.clear();
         const data = this.texture.lock() as Uint8Array;
         data.fill(0);
         this.texture.unlock();
@@ -347,8 +565,19 @@ class SplatPaintRuntime {
         this.processor?.destroy();
         this.splat.setPaintTexture(null);
         this.texture.destroy();
+        this.eraseTargetTexture.destroy();
     }
 }
 
 export { SplatPaintRuntime };
-export type { PaintEraseDelta, PaintSampleData, PaintSettings, PaintStrokeDelta };
+export type {
+    PaintCommitDiagnostic,
+    PaintDiagnosticCommitResult,
+    PaintErasePreview,
+    PaintEraseDelta,
+    PaintPreviewMode,
+    PaintSampleData,
+    ScreenPaintSettings,
+    PaintSettings,
+    PaintStrokeDelta
+};

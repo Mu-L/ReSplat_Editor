@@ -4,9 +4,12 @@ const vertexShader = /* glsl*/ `
 uniform sampler2D splatState;
 uniform sampler2D soloMask;             // 255 = visible, 0 = hidden (point-cloud-group solo)
 uniform sampler2D desaturateMask;       // 255 = desaturate, 0 = normal (point-cloud-group edit)
+uniform sampler2D paintShMask;           // accumulated paint alpha used to attenuate view-dependent SH
 
 #if PAINT_ENABLED
 uniform sampler2D paintColor;           // transient local paint stroke (rgb + strength)
+uniform sampler2D paintEraseTarget;     // final appearance with the active paint layer removed
+uniform float paintPreviewMode;         // 0: paint, 1: erase layer color, 2: erase attached splat opacity
 #endif
 
 uniform vec4 selectedClr;
@@ -268,13 +271,23 @@ void main(void) {
     #elif FORWARD_PASS
         // read color
         color = getColor();
+        float shPaintFactor = 1.0 - texelFetch(paintShMask, splat.uv, 0).r;
 
         // Preview the current uncommitted paint stroke on the DC base color.
         // The stroke is baked into f_dc on pointer-up, at which point this
         // texture is cleared before the next frame.
         #if PAINT_ENABLED
         vec4 painted = texelFetch(paintColor, splat.uv, 0);
-        color.xyz = mix(color.xyz, painted.xyz, painted.a);
+        if (paintPreviewMode < 0.5) {
+            color.xyz = mix(color.xyz, painted.xyz, painted.a);
+            shPaintFactor *= 1.0 - painted.a;
+        } else if (paintPreviewMode < 1.5) {
+            vec4 eraseTarget = texelFetch(paintEraseTarget, splat.uv, 0);
+            color.xyz = mix(color.xyz, eraseTarget.xyz, painted.a);
+            shPaintFactor = mix(shPaintFactor, 1.0 - eraseTarget.a, painted.a);
+        } else {
+            color.a *= 1.0 - painted.a;
+        }
         #endif
 
         // evaluate spherical harmonics
@@ -288,7 +301,7 @@ void main(void) {
             readSHData(sh, scale);
 
             // evaluate
-            color.xyz += evalSH(sh, dir) * scale;
+            color.xyz += evalSH(sh, dir) * scale * shPaintFactor;
         #endif
 
         // apply tint/brightness

@@ -7,13 +7,10 @@ import balanceSvg from './svg/balance.svg';
 import coordSpaceSvg from './svg/compass.svg';
 import eraserSvg from './svg/eraser.svg';
 import imagesSvg from './svg/images.svg';
-import translateSvg from './svg/move.svg';
 import originSvg from './svg/origin.svg';
 import paintBrushSvg from './svg/paintbrush.svg';
 import redoSvg from './svg/redo.svg';
-import rotateSvg from './svg/rotate.svg';
 import measureSvg from './svg/ruler.svg';
-import scaleSvg from './svg/scale.svg';
 import brushSvg from './svg/select-brush.svg';
 import eyedropperSvg from './svg/select-eyedropper.svg';
 import floodSvg from './svg/select-flood.svg';
@@ -22,6 +19,7 @@ import lassoSvg from './svg/select-lasso.svg';
 import opacitySvg from './svg/select-opacity.svg';
 import pickerSvg from './svg/select-picker.svg';
 import polygonSvg from './svg/select-poly.svg';
+import segmentSvg from './svg/select-segment.svg';
 import undoSvg from './svg/undo.svg';
 import { Tooltips } from './tooltips';
 
@@ -72,6 +70,11 @@ class LeftToolbar extends Container {
 
         const flood = new Button({
             id: 'left-toolbar-flood',
+            class: 'left-toolbar-tool'
+        });
+
+        const segment = new Button({
+            id: 'left-toolbar-segment',
             class: 'left-toolbar-tool'
         });
 
@@ -138,21 +141,6 @@ class LeftToolbar extends Container {
             class: ['left-toolbar-tool', 'paint-mode-tool']
         });
 
-        const translate = new Button({
-            id: 'left-toolbar-translate',
-            class: 'left-toolbar-tool'
-        });
-
-        const rotate = new Button({
-            id: 'left-toolbar-rotate',
-            class: 'left-toolbar-tool'
-        });
-
-        const scale = new Button({
-            id: 'left-toolbar-scale',
-            class: 'left-toolbar-tool'
-        });
-
         const measure = new Button({
             id: 'left-toolbar-measure',
             class: 'left-toolbar-tool'
@@ -175,7 +163,7 @@ class LeftToolbar extends Container {
 
         const paintTools = [paintBrush, paintEraser, paintEyedropper, paintDecal];
         const editTools = [
-            picker, polygon, brush, lasso, flood, translate, rotate, scale,
+            picker, polygon, brush, lasso, flood, segment,
             measure, orient, coordSpace, origin
         ];
 
@@ -184,6 +172,7 @@ class LeftToolbar extends Container {
         picker.dom.appendChild(createSvg(pickerSvg));
         polygon.dom.appendChild(createSvg(polygonSvg));
         brush.dom.appendChild(createSvg(brushSvg));
+        segment.dom.appendChild(createSvg(segmentSvg));
         lasso.dom.appendChild(createSvg(lassoSvg));
         eyedropper.dom.appendChild(createSvg(eyedropperSvg));
         opacity.dom.appendChild(createSvg(opacitySvg));
@@ -194,9 +183,6 @@ class LeftToolbar extends Container {
         paintDecal.dom.appendChild(createSvg(imagesSvg));
         paintDecalSubdivide.dom.appendChild(createSvg(imagesSvg));
         paintDecalShrinkwrap.dom.appendChild(createSvg(imagesSvg));
-        translate.dom.appendChild(createSvg(translateSvg));
-        rotate.dom.appendChild(createSvg(rotateSvg));
-        scale.dom.appendChild(createSvg(scaleSvg));
         measure.dom.appendChild(createSvg(measureSvg));
         orient.dom.appendChild(createSvg(balanceSvg));
         coordSpace.dom.appendChild(createSvg(coordSpaceSvg));
@@ -235,7 +221,7 @@ class LeftToolbar extends Container {
         });
 
         const separatorBeforeEditTools = new Element({ class: 'left-toolbar-separator' });
-        const separatorBeforeMeasure = new Element({ class: 'left-toolbar-separator' });
+        const separatorAfterSegment = new Element({ class: 'left-toolbar-separator' });
 
         this.append(undo);
         this.append(redo);
@@ -245,11 +231,9 @@ class LeftToolbar extends Container {
         this.append(polygon);
         this.append(lasso);
         this.append(flood);
+        this.append(segment);
+        this.append(separatorAfterSegment);
         paintTools.forEach(button => this.append(button));
-        this.append(translate);
-        this.append(rotate);
-        this.append(scale);
-        this.append(separatorBeforeMeasure);
         this.append(measure);
         this.append(orient);
         this.append(coordSpace);
@@ -370,6 +354,8 @@ class LeftToolbar extends Container {
                 const measured = this.dom.getBoundingClientRect().height;
                 // Only cache a real measurement — the constructor runs before the
                 // toolbar is appended to the DOM, so an early call yields height 0.
+                // Measuring the rendered toolbar also includes the Segment Select
+                // button and its following separator in the compact-mode threshold.
                 if (measured > 0) nonCompactHeight = measured;
             }
 
@@ -794,6 +780,7 @@ class LeftToolbar extends Container {
         picker.dom.addEventListener('click', () => events.fire('tool.rectSelection'));
         eyedropper.dom.addEventListener('click', () => events.fire('tool.eyedropperSelection'));
         floodPopupBtn.dom.addEventListener('click', () => events.fire('tool.floodSelection'));
+        segment.dom.addEventListener('click', () => events.fire('tool.segmentSelection'));
         opacity.dom.addEventListener('click', () => events.fire('tool.opacitySelection'));
         size.dom.addEventListener('click', () => events.fire('tool.sizeSelection'));
 
@@ -901,9 +888,6 @@ class LeftToolbar extends Container {
         [paintBrush, paintEraser, paintEyedropper].forEach((button, index) => {
             button.dom.addEventListener('click', () => events.fire('paint.tool.set', paintToolNames[index]));
         });
-        translate.dom.addEventListener('click', () => events.fire('tool.move'));
-        rotate.dom.addEventListener('click', () => events.fire('tool.rotate'));
-        scale.dom.addEventListener('click', () => events.fire('tool.scale'));
         measure.dom.addEventListener('click', () => events.fire('tool.measure'));
         orient.dom.addEventListener('click', () => events.fire('tool.orient'));
         coordSpace.dom.addEventListener('click', () => events.fire('tool.toggleCoordSpace'));
@@ -924,10 +908,9 @@ class LeftToolbar extends Container {
             paintTools.forEach((button) => {
                 button.hidden = !painting;
             });
-            // The edit-only section below the paint tools is hidden in paint
-            // mode, so its separator would otherwise sit directly beside the
-            // paint-tools separator.
-            separatorBeforeMeasure.hidden = painting;
+            // The selection tools are hidden in paint mode, so their trailing
+            // separator would otherwise sit directly above the paint tools.
+            separatorAfterSegment.hidden = painting;
             paintTools.forEach((button) => {
                 button.enabled = painting && !paintBusy;
             });
@@ -952,9 +935,9 @@ class LeftToolbar extends Container {
             paintDecalSubdivide.class[mode === 'subdivide' ? 'add' : 'remove']('active');
             paintDecalShrinkwrap.class[mode === 'shrinkwrap' ? 'add' : 'remove']('active');
             tooltips.unregister(paintDecal);
-            tooltips.register(paintDecal, localize(mode === 'shrinkwrap' ?
+            tooltips.register(paintDecal, tooltip(mode === 'shrinkwrap' ?
                 'paint.tool.decal-shrinkwrap' :
-                'paint.tool.decal-subdivide'));
+                'paint.tool.decal-subdivide', 'paint.tool.decal'));
         });
 
         events.on('mode.changed', (mode: 'edit' | 'paint') => {
@@ -985,11 +968,9 @@ class LeftToolbar extends Container {
             picker.class[toolName === 'rectSelection' ? 'add' : 'remove']('active');
             brush.class[(isCompact ? compactTools.includes(toolName) : toolName === 'brushSelection') ? 'add' : 'remove']('active');
             flood.class[['floodSelection', 'eyedropperSelection', 'opacitySelection', 'sizeSelection'].includes(toolName) ? 'add' : 'remove']('active');
+            segment.class[toolName === 'segmentSelection' ? 'add' : 'remove']('active');
             polygon.class[toolName === 'polygonSelection' ? 'add' : 'remove']('active');
             lasso.class[toolName === 'lassoSelection' ? 'add' : 'remove']('active');
-            translate.class[toolName === 'move' ? 'add' : 'remove']('active');
-            rotate.class[toolName === 'rotate' ? 'add' : 'remove']('active');
-            scale.class[toolName === 'scale' ? 'add' : 'remove']('active');
             measure.class[toolName === 'measure' ? 'add' : 'remove']('active');
             orient.class[toolName === 'orient' ? 'add' : 'remove']('active');
             eyedropper.class[toolName === 'eyedropperSelection' ? 'add' : 'remove']('active');
@@ -1049,9 +1030,7 @@ class LeftToolbar extends Container {
         tooltips.register(polygon, tooltip('tooltip.left-toolbar.polygon', 'tool.polygonSelection'));
         tooltips.register(brush, tooltip('tooltip.left-toolbar.brush', 'tool.brushSelection'));
         tooltips.register(flood, tooltip('tooltip.left-toolbar.eyedropper', 'tool.eyedropperSelection'));
-        tooltips.register(translate, tooltip('tooltip.left-toolbar.translate', 'tool.move'));
-        tooltips.register(rotate, tooltip('tooltip.left-toolbar.rotate', 'tool.rotate'));
-        tooltips.register(scale, tooltip('tooltip.left-toolbar.scale', 'tool.scale'));
+        tooltips.register(segment, tooltip('tooltip.left-toolbar.segment', 'tool.segmentSelection'));
         tooltips.register(measure, tooltip('tooltip.left-toolbar.measure'));
         tooltips.register(orient, tooltip('tooltip.left-toolbar.orient'));
         tooltips.register(coordSpace, tooltip('tooltip.left-toolbar.local-space', 'tool.toggleCoordSpace'));
@@ -1060,10 +1039,10 @@ class LeftToolbar extends Container {
         tooltips.register(floodPopupBtn, tooltip('tooltip.left-toolbar.flood', 'tool.floodSelection'));
         tooltips.register(opacity, tooltip('tooltip.left-toolbar.opacity', 'tool.opacitySelection'));
         tooltips.register(size, tooltip('tooltip.left-toolbar.size', 'tool.sizeSelection'));
-        tooltips.register(paintBrush, localize('paint.tool.brush'));
-        tooltips.register(paintEraser, localize('paint.tool.eraser'));
-        tooltips.register(paintEyedropper, localize('paint.tool.eyedropper'));
-        tooltips.register(paintDecal, localize('paint.tool.decal-subdivide'));
+        tooltips.register(paintBrush, tooltip('paint.tool.brush', 'paint.tool.brush'));
+        tooltips.register(paintEraser, tooltip('paint.tool.eraser', 'paint.tool.eraser'));
+        tooltips.register(paintEyedropper, tooltip('paint.tool.eyedropper', 'paint.tool.eyedropper'));
+        tooltips.register(paintDecal, tooltip('paint.tool.decal-subdivide', 'paint.tool.decal'));
         tooltips.register(paintDecalSubdivide, localize('paint.tool.decal-subdivide'));
         tooltips.register(paintDecalShrinkwrap, localize('paint.tool.decal-shrinkwrap'));
 

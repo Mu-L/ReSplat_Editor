@@ -40,6 +40,7 @@ import { PolygonSelection } from './tools/polygon-selection';
 import { RectSelection } from './tools/rect-selection';
 import { RotateTool } from './tools/rotate-tool';
 import { ScaleTool } from './tools/scale-tool';
+import { SegmentSelection } from './tools/segment-selection';
 import { SizeSelection } from './tools/size-selection';
 import { SphereSelection } from './tools/sphere-selection';
 import { ToolManager } from './tools/tool-manager';
@@ -652,6 +653,15 @@ const main = async () => {
 
     // tool manager
     const toolManager = new ToolManager(events);
+    const segmentSelection = new SegmentSelection(
+        events,
+        scene,
+        editorUI.toolsContainer.dom,
+        editorUI.canvasContainer
+    );
+    // Begin bundled SAM2 model loading during application startup. Segment
+    // operations reuse the runtime's in-flight promise or ready sessions.
+    segmentSelection.preload();
     toolManager.register('rectSelection', new RectSelection(events, editorUI.toolsContainer.dom));
     toolManager.register('brushSelection', new BrushSelection(events, editorUI.toolsContainer.dom, mask));
     toolManager.register('floodSelection', new FloodSelection(events, editorUI.toolsContainer.dom, mask, editorUI.canvasContainer));
@@ -662,6 +672,7 @@ const main = async () => {
     toolManager.register('eyedropperSelection', new EyedropperSelection(events, editorUI.toolsContainer.dom, editorUI.canvasContainer));
     toolManager.register('opacitySelection', new OpacitySelection(events, editorUI.toolsContainer.dom, editorUI.canvasContainer));
     toolManager.register('sizeSelection', new SizeSelection(events, editorUI.toolsContainer.dom, editorUI.canvasContainer));
+    toolManager.register('segmentSelection', segmentSelection);
     toolManager.register('paint', new PaintTool(events, scene, editorUI.toolsContainer.dom, editorUI.canvasContainer), 'paint');
     toolManager.register('move', new MoveTool(events, scene));
     toolManager.register('rotate', new RotateTool(events, scene));
@@ -741,7 +752,7 @@ const main = async () => {
     });
 
     // Tools that have their own select-toolbar and would visually overlap with the wrapper toolbar
-    const toolsWithToolbar = new Set(['opacitySelection', 'sizeSelection', 'eyedropperSelection', 'floodSelection', 'measure']);
+    const toolsWithToolbar = new Set(['opacitySelection', 'sizeSelection', 'eyedropperSelection', 'floodSelection', 'segmentSelection', 'measure']);
     let blockingPlaneToolbarHiddenByOtherTool = false;
 
     blockingPlaneToolbar.dom.addEventListener('pointerdown', (e) => {

@@ -119,6 +119,8 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
     };
 
     events.function('render.offscreen', async (width: number, height: number): Promise<Uint8Array> => {
+        const savedRenderOverlays = scene.camera.renderOverlays;
+        const savedGizmoLayerEnabled = scene.gizmoLayer.enabled;
         try {
             // start rendering to offscreen buffer only
             scene.camera.startOffscreenMode(width, height);
@@ -152,8 +154,8 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             return data;
         } finally {
             scene.camera.endOffscreenMode();
-            scene.camera.renderOverlays = true;
-            scene.gizmoLayer.enabled = true;
+            scene.camera.renderOverlays = savedRenderOverlays;
+            scene.gizmoLayer.enabled = savedGizmoLayerEnabled;
             scene.camera.camera.clearColor.set(0, 0, 0, 0);
         }
     });

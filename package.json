@@ -1,6 +1,6 @@
 {
     "name": "ReSplat",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "main": "electron/main.cjs",
     "author": "Re祁",
     "homepage": "https://playcanvas.com/ReSplat/editor",
@@ -23,11 +23,15 @@
         "local:build": "npm run build && npm run local",
         "postinstall": "node scripts/patch-splat-transform.mjs",
         "test:paint-through": "node scripts/test-paint-through.mjs",
+        "test:paint-screen-selection": "node scripts/test-paint-screen-selection.mjs",
         "test:paint-layers": "node scripts/test-paint-layers.mjs",
         "test:paint-parameter-adjustment": "node scripts/test-paint-parameter-adjustment.mjs",
+        "test:paint-diagnostic": "node scripts/test-paint-diagnostic.mjs",
         "test:lod-convert-path": "node scripts/test-lod-convert-path.mjs",
         "test:html-export-large-file-read": "node scripts/test-html-export-large-file-read.mjs",
         "test:shrinkwrap-opacity": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-shrinkwrap-opacity.mjs",
+        "test:segment-select": "vitest run src/segment-selection",
+        "test:segment-select-data": "node scripts/test-segment-select-data.mjs",
         "electron:dev": "npm run build && electron .",
         "electron:build": "npm run build && electron-builder",
         "lint": "eslint src"
@@ -41,6 +45,7 @@
         "express": "^4.21.0",
         "multer": "^1.4.5-lts.1",
         "node-addon-api": "^8.9.0",
+        "onnxruntime-web": "1.29.0",
         "playcanvas": "2.18.2"
     },
     "devDependencies": {
@@ -76,6 +81,7 @@
         "serve": "14.2.6",
         "tslib": "2.8.1",
         "typescript": "6.0.3",
+        "vitest": "4.0.17",
         "wait-on": "^9.0.10"
     },
     "build": {
@@ -93,6 +99,7 @@
             "native/**/*.node",
             "native/index.js",
             "node_modules/**/*",
+            "!dist/static/models/**/*",
             "!node_modules/**/*.map",
             "!node_modules/**/*.ts",
             "!node_modules/electron/**",

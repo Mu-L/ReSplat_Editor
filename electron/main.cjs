@@ -74,23 +74,27 @@ const APP_MIME_TYPES = {
     '.woff2': 'font/woff2',
     '.ttf':  'font/ttf',
     '.otf':  'font/otf',
+    '.onnx': 'application/octet-stream',
     '.map':  'application/json; charset=utf-8'
 };
 
-// Register the app:// protocol handler. Serves files from dist/ with correct
-// MIME types and path-traversal protection. Called after app.ready, before
-// createWindow.
+// Register the app:// protocol handler. Serves regular files from dist/ and
+// packaged SAM2 models from resources/static/models, with MIME types and
+// path-traversal protection. Called after app.ready, before createWindow.
 function registerAppProtocol() {
     const distPath = path.join(__dirname, '..', 'dist');
     protocol.handle('app', async (request) => {
         const url = new URL(request.url);
         // With standard:true, app://bundle/index.html → host='bundle', pathname='/index.html'
-        // We ignore host (always 'bundle') and serve from dist/ by pathname.
+        // We ignore host (always 'bundle') and resolve by pathname.
         const filePath = decodeURIComponent(url.pathname).slice(1); // strip leading '/'
 
-        // Security: normalize + prevent traversal outside dist/
-        const resolved = path.normalize(path.join(distPath, filePath));
-        if (resolved !== distPath && !resolved.startsWith(distPath + path.sep)) {
+        // URL paths always use forward slashes, including on Windows.
+        const packagedModelPrefix = 'static/models/';
+        const assetRoot = electronApp.isPackaged && filePath.startsWith(packagedModelPrefix) ?
+            process.resourcesPath : distPath;
+        const resolved = path.normalize(path.join(assetRoot, filePath));
+        if (resolved !== assetRoot && !resolved.startsWith(assetRoot + path.sep)) {
             return new Response('Forbidden', { status: 403 });
         }
 

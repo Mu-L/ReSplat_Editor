@@ -31,6 +31,33 @@
         width: 70px;
     }
 
+    .select-toolbar-separator {
+        width: 2px;
+        height: 38px;
+        margin: 0px 6px;
+        flex: 0 0 2px;
+        background-color: $bcg-lighter;
+    }
+
+    &.segment-select-toolbar {
+        gap: 4px;
+        max-width: calc(100vw - 24px);
+
+        .segment-model-label {
+            margin-left: 6px;
+            white-space: nowrap;
+            color: $text-secondary;
+        }
+
+        .segment-status-label {
+            min-width: 92px;
+            max-width: 190px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+    }
+
     &.paint-toolbar {
         gap: 8px;
 

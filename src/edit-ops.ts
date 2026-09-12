@@ -866,19 +866,25 @@ class PaintStrokeOp {
     before: Float32Array;
     after: Float32Array;
     colors: Float32Array | null;
+    beforeShMask: Uint8Array | null;
+    afterShMask: Uint8Array | null;
 
     constructor(options: {
         splat: Splat,
         indices: Uint32Array,
         before: Float32Array,
         after: Float32Array,
-        colors?: Float32Array | null
+        colors?: Float32Array | null,
+        beforeShMask?: Uint8Array | null,
+        afterShMask?: Uint8Array | null
     }) {
         this.splat = options.splat;
         this.indices = options.indices;
         this.before = options.before;
         this.after = options.after;
         this.colors = options.colors ?? null;
+        this.beforeShMask = options.beforeShMask ?? null;
+        this.afterShMask = options.afterShMask ?? null;
 
         if (this.before.length !== this.indices.length * 3 || this.after.length !== this.indices.length * 3) {
             throw new Error('PaintStrokeOp requires three before/after values per splat.');
@@ -886,14 +892,21 @@ class PaintStrokeOp {
         if (this.colors && this.colors.length !== this.indices.length * 4) {
             throw new Error('PaintStrokeOp requires four paint color values per splat.');
         }
+        if ((this.beforeShMask || this.afterShMask) &&
+            (!this.beforeShMask || !this.afterShMask ||
+                this.beforeShMask.length !== this.indices.length || this.afterShMask.length !== this.indices.length)) {
+            throw new Error('PaintStrokeOp requires paired before/after SH mask values per splat.');
+        }
     }
 
     do() {
         this.splat.applyPaintValues(this.indices, this.after);
+        if (this.afterShMask) this.splat.applyPaintShMaskValues(this.indices, this.afterShMask);
     }
 
     undo() {
         this.splat.applyPaintValues(this.indices, this.before);
+        if (this.beforeShMask) this.splat.applyPaintShMaskValues(this.indices, this.beforeShMask);
     }
 
     serialize() {
@@ -904,7 +917,9 @@ class PaintStrokeOp {
                 indices: encodeTypedArray(this.indices),
                 before: encodeTypedArray(this.before),
                 after: encodeTypedArray(this.after),
-                colors: this.colors ? encodeTypedArray(this.colors) : null
+                colors: this.colors ? encodeTypedArray(this.colors) : null,
+                beforeShMask: this.beforeShMask ? encodeTypedArray(this.beforeShMask) : null,
+                afterShMask: this.afterShMask ? encodeTypedArray(this.afterShMask) : null
             }
         };
     }
@@ -915,7 +930,9 @@ class PaintStrokeOp {
             indices: decodeUint32Array(data.indices),
             before: decodeFloat32Array(data.before),
             after: decodeFloat32Array(data.after),
-            colors: data.colors ? decodeFloat32Array(data.colors) : null
+            colors: data.colors ? decodeFloat32Array(data.colors) : null,
+            beforeShMask: data.beforeShMask ? decodeUint8Array(data.beforeShMask) : null,
+            afterShMask: data.afterShMask ? decodeUint8Array(data.afterShMask) : null
         });
     }
 }

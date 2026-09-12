@@ -97,6 +97,9 @@ class AboutPopup extends Container {
         });
         const poweredByText = new Label({ class: 'about-dep-name', text: 'powered by SuperSplat' });
         poweredByRow.append(poweredByText);
+        poweredByRow.dom.addEventListener('click', () => {
+            openUrl('https://github.com/playcanvas/supersplat');
+        });
 
         // NanoGS attribution — CC BY-NC 4.0 (adapted material, see src/nanogs/README.md)
         const nanogsRow = new Container({
@@ -108,9 +111,39 @@ class AboutPopup extends Container {
             openUrl('https://github.com/RongLiu-Leo/NanoGS');
         });
 
+        const sam2Row = new Container({
+            class: 'about-dep-row'
+        });
+        const sam2Text = new Label({ class: 'about-dep-name', text: 'Segment Select by Meta SAM 2 (Apache-2.0)' });
+        sam2Row.append(sam2Text);
+        sam2Row.dom.addEventListener('click', () => {
+            openUrl('https://github.com/facebookresearch/sam2');
+        });
+
+        const onnxRow = new Container({
+            class: 'about-dep-row'
+        });
+        const onnxText = new Label({ class: 'about-dep-name', text: 'inference by ONNX Runtime Web (MIT)' });
+        onnxRow.append(onnxText);
+        onnxRow.dom.addEventListener('click', () => {
+            openUrl('https://github.com/microsoft/onnxruntime');
+        });
+
+        const sam2OnnxRow = new Container({
+            class: 'about-dep-row'
+        });
+        const sam2OnnxText = new Label({ class: 'about-dep-name', text: 'SAM 2 ONNX export by vietanhdev (Apache-2.0)' });
+        sam2OnnxRow.append(sam2OnnxText);
+        sam2OnnxRow.dom.addEventListener('click', () => {
+            openUrl('https://huggingface.co/vietanhdev/segment-anything-2-onnx-models');
+        });
+
         depsContainer.append(contactRow);
         depsContainer.append(poweredByRow);
         depsContainer.append(nanogsRow);
+        depsContainer.append(sam2Row);
+        depsContainer.append(onnxRow);
+        depsContainer.append(sam2OnnxRow);
 
         // Assemble content
         content.append(logoContainer);

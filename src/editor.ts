@@ -10,6 +10,7 @@ import { Events } from './events';
 import { IndexRanges } from './index-ranges';
 import type { GridPlane } from './infinite-grid';
 import { Scene } from './scene';
+import type { ResolvedMaskSelection, ResolveMaskOptions, SelectionMaskOperation } from './selection-mask';
 import { SphereShape } from './sphere-shape';
 import { Splat } from './splat';
 import { SingleSplat } from './splat-serialize';
@@ -200,11 +201,11 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
     let savedSelectedAlpha: number | null = null;
     let savedBoundVisible: boolean | null = null;
 
-    events.on('grid.toggleVisible', () => {
-        setGridVisible(!scene.grid.visible);
-        gizmoKeyHidden = !gizmoKeyHidden;
+    const setGizmoKeyHidden = (hidden: boolean) => {
+        if (hidden === gizmoKeyHidden) return;
+        gizmoKeyHidden = hidden;
 
-        if (gizmoKeyHidden) {
+        if (hidden) {
             const clr = events.invoke('selectedClr') as Color;
             savedSelectedAlpha = clr.a;
             events.fire('setSelectedClr', new Color(clr.r, clr.g, clr.b, 0));
@@ -223,6 +224,17 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
             }
             events.fire('gizmo.keyShow');
         }
+    };
+
+    events.function('gizmo.keyHidden', () => gizmoKeyHidden);
+
+    events.on('gizmo.setKeyHidden', (hidden: boolean) => {
+        setGizmoKeyHidden(hidden);
+    });
+
+    events.on('grid.toggleVisible', () => {
+        setGridVisible(!scene.grid.visible);
+        setGizmoKeyHidden(!gizmoKeyHidden);
     });
 
     setGridVisible(scene.config.show.grid);
@@ -485,12 +497,29 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
     // Wrapper that records the selection to the splat's LodEditLog (if present)
     // BEFORE constructing SelectOp, because SelectOp consumes sel in its
     // constructor. For non-LCC splats lodEditLog is null and this is a no-op.
-    const fireSelectWithLog = (splat: Splat, op: 'add'|'remove'|'set', sel: Uint8Array | Uint32Array) => {
+    const fireSelectWithLog = (splat: Splat, op: SelectionMaskOperation, sel: Uint8Array | Uint32Array) => {
         // 独立编辑激活时，剔除组外点云，使选择/选区工具只能命中组内点云
         const edited = events.invoke('pointCloudGroup.editActive') ? splat.desaturateMaskData : null;
         let filteredSel = sel;
         if (edited && edited.length > 0) {
-            if (sel instanceof Uint32Array) {
+            if (op === 'set') {
+                // A set operation must preserve selection outside the active
+                // independent-edit group. Converting to a mask lets us carry
+                // the existing state for protected rows rather than treating
+                // them as misses (which would incorrectly deselect them).
+                const state = splat.splatData.getProp('state') as Uint8Array;
+                const mask = sel instanceof Uint32Array ? new Uint8Array(state.length) : new Uint8Array(sel);
+                if (sel instanceof Uint32Array) {
+                    for (let i = 0; i < sel.length; i++) {
+                        if (sel[i] < mask.length) mask[sel[i]] = 255;
+                    }
+                }
+                const n = Math.min(mask.length, edited.length);
+                for (let i = 0; i < n; i++) {
+                    if (edited[i] !== 0) mask[i] = (state[i] & State.selected) !== 0 ? 255 : 0;
+                }
+                filteredSel = mask;
+            } else if (sel instanceof Uint32Array) {
                 const keep: number[] = [];
                 for (let i = 0; i < sel.length; i++) {
                     const idx = sel[i];
@@ -507,44 +536,69 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
         splat.lodEditLog?.onEditHistoryAdd();
         splat.lodEditLog?.recordSelect(splat, op, filteredSel);
         events.fire('edit.add', new SelectOp(splat, op, filteredSel));
+        // edit.add queues the async GPU state update synchronously. Append a
+        // barrier so callers that need a committed selection can wait for it
+        // without bypassing the edit.add observers used by the UI.
+        return scene.commandQueue.enqueue(() => {});
     };
 
-    const intersectCenters = (splat: Splat, op: 'add'|'remove'|'set', options: any) => {
+    const filterBlockingPlanes = (splat: Splat, data: Uint8Array) => {
+        const blockingPlanes = events.invoke('blockingPlanes.get') as BlockingPlane[];
+        if (!blockingPlanes || blockingPlanes.length === 0) return;
+
+        const splatData = splat.splatData;
+        const x = splatData.getProp('x') as Float32Array;
+        const y = splatData.getProp('y') as Float32Array;
+        const z = splatData.getProp('z') as Float32Array;
+        if (!x || !y || !z) return;
+
+        const cameraPos = scene.camera.position;
+        const worldPos = new Vec3();
+        for (let i = 0; i < data.length; i++) {
+            if (data[i] !== 255) continue;
+            worldPos.set(x[i], y[i], z[i]);
+            splat.worldTransform.transformPoint(worldPos, worldPos);
+            if (isPointBlocked(worldPos, cameraPos)) {
+                data[i] = 0;
+            }
+        }
+    };
+
+    const resolveCenters = (splat: Splat, options: any, boundOptions?: any): Promise<Uint8Array> => {
         // run the GPU intersect inside one queued task so the gpu readback is
         // ordered relative to other queued history ops (rapid drag + undo,
         // drag-while-camera-settling, etc).
         return scene.commandQueue.enqueue(async () => {
             const data = await scene.dataProcessor.intersect(options, splat);
-
-            // Apply blocking plane filter to GPU intersection results
-            const blockingPlanes = events.invoke('blockingPlanes.get') as BlockingPlane[];
-            if (blockingPlanes && blockingPlanes.length > 0) {
-                const splatData = splat.splatData;
-                const x = splatData.getProp('x') as Float32Array;
-                const y = splatData.getProp('y') as Float32Array;
-                const z = splatData.getProp('z') as Float32Array;
-                if (x && y && z) {
-                    const cameraPos = scene.camera.position;
-                    const worldPos = new Vec3();
-                    // Mask-based result — filter out blocked splats
-                    for (let i = 0; i < data.length; i++) {
-                        if (data[i] === 255) {
-                            worldPos.set(x[i], y[i], z[i]);
-                            splat.worldTransform.transformPoint(worldPos, worldPos);
-                            if (isPointBlocked(worldPos, cameraPos)) {
-                                data[i] = 0;
-                            }
+            try {
+                // The packed GPU mask is texture-aligned and can contain tail
+                // bytes beyond the actual Gaussian count. Public selection
+                // snapshots must always be exactly one byte per Gaussian so
+                // visible-ID observations can be combined with center hits.
+                const hits = data.subarray(0, splat.splatData.numSplats);
+                if (boundOptions) {
+                    const boundData = await scene.dataProcessor.intersect(boundOptions, splat);
+                    try {
+                        for (let i = 0; i < hits.length; i++) {
+                            hits[i] = hits[i] && boundData[i] ? 255 : 0;
                         }
+                    } finally {
+                        scene.dataProcessor.releaseMask(boundData);
                     }
                 }
+                filterBlockingPlanes(splat, hits);
+                // GPU masks come from a pool. Commit a private snapshot before
+                // returning so later queued work cannot overwrite this result.
+                return new Uint8Array(hits);
+            } finally {
+                scene.dataProcessor.releaseMask(data);
             }
-
-            // SelectOp consumes `data` synchronously in its constructor
-            // (IndexRanges.fromPredicate iterates immediately), so we can
-            // return the buffer to the pool as soon as the op is constructed.
-            fireSelectWithLog(splat, op, data);
-            scene.dataProcessor.releaseMask(data);
         });
+    };
+
+    const intersectCenters = async (splat: Splat, op: SelectionMaskOperation, options: any) => {
+        const hits = await resolveCenters(splat, options);
+        fireSelectWithLog(splat, op, hits);
     };
 
     // Helper: get GPU intersect options for a selected bound shape (BoxShape or SphereShape)
@@ -720,139 +774,145 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
         }
     });
 
-    let maskTexture: Texture = null;
-
-    events.function('select.byMask', async (op: 'add'|'remove'|'set', canvas: HTMLCanvasElement, context: CanvasRenderingContext2D) => {
+    events.function('select.resolveMask', async (
+        canvas: HTMLCanvasElement,
+        context: CanvasRenderingContext2D,
+        options: ResolveMaskOptions = {}
+    ): Promise<ResolvedMaskSelection | null> => {
         const mode = events.invoke('camera.mode');
         const overlay = events.invoke('camera.overlay');
+        const projection = options.projection ?? 'auto';
 
-        // When a bound shape is selected, restrict to points inside the shape
+        // When a bound shape is selected, restrict to points inside the shape.
         const shapeSel = events.invoke('shapeSelection');
         const boundOptions = (shapeSel instanceof BoxShape || shapeSel instanceof SphereShape) ?
             getBoundIntersectOptions(shapeSel) : null;
+        const splat = selectedSplats()[0];
+        if (!splat || canvas.width === 0 || canvas.height === 0) return null;
 
-        for (const splat of selectedSplats()) {
-            if (mode === 'centers' || overlay) {
-                // create mask texture
-                if (!maskTexture || maskTexture.width !== canvas.width || maskTexture.height !== canvas.height) {
-                    if (maskTexture) {
-                        maskTexture.destroy();
-                    }
-                    maskTexture = new Texture(scene.graphicsDevice);
-                }
-                maskTexture.setSource(canvas);
+        if (projection === 'centers' || (projection === 'auto' && (mode === 'centers' || overlay))) {
+            // Snapshot the source before awaiting GPU work. Selection tools share
+            // their drawing canvas and may clear or redraw it immediately.
+            const snapshot = document.createElement('canvas');
+            snapshot.width = canvas.width;
+            snapshot.height = canvas.height;
+            const snapshotContext = snapshot.getContext('2d');
+            if (!snapshotContext) return null;
+            snapshotContext.drawImage(canvas, 0, 0);
 
-                if (boundOptions) {
-                    const mt = maskTexture;
-                    // Two-pass: flood mask AND bound mask
-                    scene.commandQueue.enqueue(async () => {
-                        const floodData = await scene.dataProcessor.intersect({ mask: mt }, splat);
-                        const boundData = await scene.dataProcessor.intersect(boundOptions, splat);
-                        for (let i = 0; i < floodData.length; i++) {
-                            floodData[i] = floodData[i] && boundData[i];
-                        }
-                        scene.dataProcessor.releaseMask(boundData);
-                        fireSelectWithLog(splat, op, floodData);
-                        scene.dataProcessor.releaseMask(floodData);
-                    });
-                } else {
-                    await intersectCenters(splat, op, {
-                        mask: maskTexture
-                    });
-                }
-            } else {
-                const mask = context.getImageData(0, 0, canvas.width, canvas.height);
-
-                // calculate mask bound so we limit pixel operations
-                let mx0 = mask.width - 1;
-                let my0 = mask.height - 1;
-                let mx1 = 0;
-                let my1 = 0;
-                for (let y = 0; y < mask.height; ++y) {
-                    for (let x = 0; x < mask.width; ++x) {
-                        if (mask.data[(y * mask.width + x) * 4 + 3] === 255) {
-                            mx0 = Math.min(mx0, x);
-                            my0 = Math.min(my0, y);
-                            mx1 = Math.max(mx1, x);
-                            my1 = Math.max(my1, y);
-                        }
-                    }
-                }
-
-                // Convert mask bounds to normalized coordinates
-                const nx0 = mx0 / mask.width;
-                const ny0 = my0 / mask.height;
-                const nx1 = (mx1 + 1) / mask.width;
-                const ny1 = (my1 + 1) / mask.height;
-                const nw = nx1 - nx0;
-                const nh = ny1 - ny0;
-
-                scene.camera.pickPrep(splat, op);
-                const pick = await scene.camera.pickRect(nx0, ny0, nw, nh);
-
-                // Calculate actual pixel dimensions for iteration
-                const { width, height } = scene.targetSize;
-
-                // Convert normalized coordinates to render target pixels
-                const px = Math.floor(nx0 * width);
-                const py = Math.floor(ny0 * height);
-                const pw = Math.max(1, Math.ceil((nx0 + nw) * width) - px);
-                const ph = Math.max(1, Math.ceil((ny0 + nh) * height) - py);
-
-                const selected = new Set<number>();
-                for (let y = 0; y < ph; ++y) {
-                    for (let x = 0; x < pw; ++x) {
-                        const mx = Math.floor((nx0 + x / width) * mask.width);
-                        const my = Math.floor((ny0 + y / height) * mask.height);
-                        if (mask.data[(my * mask.width + mx) * 4] === 255) {
-                            selected.add(pick[(ph - 1 - y) * pw + x]);
-                        }
-                    }
-                }
-
-                // Filter out splats blocked by blocking planes
-                const blockingPlanes = events.invoke('blockingPlanes.get') as BlockingPlane[];
-                if (blockingPlanes && blockingPlanes.length > 0) {
-                    const cameraPos = scene.camera.position;
-                    const worldPos = new Vec3();
-                    const x = splat.splatData.getProp('x') as Float32Array;
-                    const y = splat.splatData.getProp('y') as Float32Array;
-                    const z = splat.splatData.getProp('z') as Float32Array;
-                    if (x && y && z) {
-                        for (const pickId of selected) {
-                            if (pickId !== undefined && pickId !== 0xffffffff && pickId < x.length) {
-                                worldPos.set(x[pickId], y[pickId], z[pickId]);
-                                splat.worldTransform.transformPoint(worldPos, worldPos);
-                                if (isPointBlocked(worldPos, cameraPos)) {
-                                    selected.delete(pickId);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // If a bound shape is selected, filter selected points to only those inside the shape
-                if (boundOptions) {
-                    const numSplats = splat.splatData.numSplats;
-                    const selectedMask = new Uint8Array(numSplats);
-                    for (const id of selected) {
-                        if (id < numSplats) selectedMask[id] = 255;
-                    }
-                    const boundMask = await scene.dataProcessor.intersect(boundOptions, splat);
-                    for (let i = 0; i < numSplats; i++) {
-                        selectedMask[i] = selectedMask[i] && boundMask[i];
-                    }
-                    scene.dataProcessor.releaseMask(boundMask);
-                    // Rebuild selected set from filtered mask
-                    selected.clear();
-                    for (let i = 0; i < numSplats; i++) {
-                        if (selectedMask[i] === 255) selected.add(i);
-                    }
-                }
-
-                const sortedIds = new Uint32Array(selected).sort();
-                fireSelectWithLog(splat, op, sortedIds);
+            const maskTexture = new Texture(scene.graphicsDevice);
+            try {
+                maskTexture.setSource(snapshot);
+                const hits = await resolveCenters(splat, { mask: maskTexture }, boundOptions);
+                return { splat, hits };
+            } finally {
+                maskTexture.destroy();
             }
+        }
+
+        // getImageData commits an operation-private CPU snapshot before the
+        // asynchronous ID pick starts.
+        const mask = context.getImageData(0, 0, canvas.width, canvas.height);
+
+        let mx0 = mask.width;
+        let my0 = mask.height;
+        let mx1 = -1;
+        let my1 = -1;
+        for (let y = 0; y < mask.height; ++y) {
+            for (let x = 0; x < mask.width; ++x) {
+                if (mask.data[(y * mask.width + x) * 4 + 3] > 0) {
+                    mx0 = Math.min(mx0, x);
+                    my0 = Math.min(my0, y);
+                    mx1 = Math.max(mx1, x);
+                    my1 = Math.max(my1, y);
+                }
+            }
+        }
+
+        // An empty gesture/semantic mask is not a request to clear selection.
+        if (mx1 < mx0 || my1 < my0) return null;
+
+        const nx0 = mx0 / mask.width;
+        const ny0 = my0 / mask.height;
+        const nx1 = (mx1 + 1) / mask.width;
+        const ny1 = (my1 + 1) / mask.height;
+        const nw = nx1 - nx0;
+        const nh = ny1 - ny0;
+
+        const collectVisible = options.collectVisible === true;
+        const pickX = collectVisible ? 0 : nx0;
+        const pickY = collectVisible ? 0 : ny0;
+        const pickWidth = collectVisible ? 1 : nw;
+        const pickHeight = collectVisible ? 1 : nh;
+
+        scene.camera.pickPrep(splat, 'set', options.alphaThreshold ?? 0);
+        const pick = await scene.camera.pickRect(pickX, pickY, pickWidth, pickHeight);
+
+        const { width, height } = scene.targetSize;
+        const px = Math.floor(pickX * width);
+        const py = Math.floor(pickY * height);
+        const pw = Math.max(1, Math.ceil((pickX + pickWidth) * width) - px);
+        const ph = Math.max(1, Math.ceil((pickY + pickHeight) * height) - py);
+
+        const hits = new Uint8Array(splat.splatData.numSplats);
+        const visible = collectVisible ? new Uint8Array(hits.length) : undefined;
+        const sourceConfidence = options.sourceConfidence?.length === mask.width * mask.height ?
+            options.sourceConfidence : undefined;
+        const coverage = collectVisible && sourceConfidence ? new Uint16Array(hits.length) : undefined;
+        const confidenceSums = coverage ? new Uint32Array(hits.length) : undefined;
+        for (let y = 0; y < ph; ++y) {
+            for (let x = 0; x < pw; ++x) {
+                const pickId = pick[(ph - 1 - y) * pw + x];
+                if (pickId !== undefined && pickId !== 0xffffffff && pickId < hits.length) {
+                    if (visible) visible[pickId] = 255;
+                    const mx = Math.min(mask.width - 1, Math.floor((pickX + x / width) * mask.width));
+                    const my = Math.min(mask.height - 1, Math.floor((pickY + y / height) * mask.height));
+                    if (coverage && confidenceSums && coverage[pickId] < 0xffff) {
+                        coverage[pickId]++;
+                        confidenceSums[pickId] += sourceConfidence![my * mask.width + mx];
+                    }
+                    if (mask.data[(my * mask.width + mx) * 4] > 127) hits[pickId] = 255;
+                }
+            }
+        }
+
+        filterBlockingPlanes(splat, hits);
+        if (visible) filterBlockingPlanes(splat, visible);
+
+        if (boundOptions) {
+            const boundMask = await scene.commandQueue.enqueue(async () => {
+                const pooled = await scene.dataProcessor.intersect(boundOptions, splat);
+                try {
+                    return new Uint8Array(pooled);
+                } finally {
+                    scene.dataProcessor.releaseMask(pooled);
+                }
+            });
+            for (let i = 0; i < hits.length; i++) {
+                hits[i] = hits[i] && boundMask[i] ? 255 : 0;
+                if (visible) visible[i] = visible[i] && boundMask[i] ? 255 : 0;
+            }
+        }
+
+        const confidence = coverage && confidenceSums ? new Uint8Array(hits.length) : undefined;
+        if (confidence && coverage && confidenceSums) {
+            for (let i = 0; i < confidence.length; i++) {
+                if (coverage[i] > 0 && visible?.[i]) confidence[i] = Math.round(confidenceSums[i] / coverage[i]);
+            }
+        }
+        return { splat, hits, visible, coverage, confidence, predictedIou: options.predictedIou };
+    });
+
+    events.function('select.applyResolvedMask', async (op: SelectionMaskOperation, resolved: ResolvedMaskSelection) => {
+        if (!resolved || resolved.splat.scene !== scene) return false;
+        await fireSelectWithLog(resolved.splat, op, resolved.hits);
+        return true;
+    });
+
+    events.function('select.byMask', async (op: SelectionMaskOperation, canvas: HTMLCanvasElement, context: CanvasRenderingContext2D) => {
+        const resolved = await events.invoke('select.resolveMask', canvas, context) as ResolvedMaskSelection | null;
+        if (resolved) {
+            fireSelectWithLog(resolved.splat, op, resolved.hits);
         }
     });
 

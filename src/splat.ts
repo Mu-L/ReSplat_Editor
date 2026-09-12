@@ -72,9 +72,16 @@ class Splat extends Element {
     // texel value 255 = desaturated (grey), 0 = normal. Never persisted.
     desaturateMaskData: Uint8Array;
     desaturateMaskTexture: Texture;
+    // Paint blends the final Gaussian appearance, so its alpha must attenuate
+    // view-dependent SH as well as the DC base color. This derived mask is
+    // rebuilt by the paint-layer manager and is not a PLY property.
+    paintShMaskData: Uint8Array;
+    paintShMaskTexture: Texture;
     // Transient GPU paint overlay. The backing texture is owned by the active
     // paint runtime so separate Splat instances never share stroke previews.
     paintTexture: Texture | null = null;
+    paintEraseTargetTexture: Texture | null = null;
+    paintPreviewMode = 0;
     // Every mesh instance keeps an explicit sampler binding. This transparent
     // fallback prevents a previous draw's paintColor scope value leaking into
     // a non-target splat when materials or shader variants are reused.
@@ -183,6 +190,9 @@ class Splat extends Element {
         const instance = this.entity.gsplat.instance;
         this.localBoundStorage = instance.resource.aabb;
         instance.meshInstance.setParameter('paintColor', this.paintTexture ?? this.emptyPaintTexture);
+        instance.meshInstance.setParameter('paintEraseTarget', this.paintEraseTargetTexture ?? this.emptyPaintTexture);
+        instance.meshInstance.setParameter('paintPreviewMode', this.paintPreviewMode);
+        instance.meshInstance.setParameter('paintShMask', this.paintShMaskTexture);
         // @ts-ignore
         this.worldBoundStorage = instance.meshInstance._aabb;
         // @ts-ignore
@@ -251,6 +261,12 @@ class Splat extends Element {
         this.desaturateMaskTexture.unlock();
         this.desaturateMaskData = new Uint8Array(this.splatData.numSplats);
 
+        this.paintShMaskTexture = this.createPerSplatTexture('paintShMask', PIXELFORMAT_R8, splatResource);
+        const paintShMaskBuffer = this.paintShMaskTexture.lock() as Uint8Array;
+        paintShMaskBuffer.fill(0);
+        this.paintShMaskTexture.unlock();
+        this.paintShMaskData = new Uint8Array(this.splatData.numSplats);
+
         // create the transform palette
         this.transformPalette = new TransformPalette(device);
         this.emptyPaintTexture = Texture.createDataTexture2D(
@@ -275,8 +291,11 @@ class Splat extends Element {
             material.setParameter('splatTransform', this.transformTexture);
             material.setParameter('soloMask', this.soloMaskTexture);
             material.setParameter('desaturateMask', this.desaturateMaskTexture);
+            material.setParameter('paintShMask', this.paintShMaskTexture);
             material.setDefine('PAINT_ENABLED', this.paintTexture ? '1' : '0');
             instance.meshInstance.setParameter('paintColor', this.paintTexture ?? this.emptyPaintTexture);
+            instance.meshInstance.setParameter('paintEraseTarget', this.paintEraseTargetTexture ?? this.emptyPaintTexture);
+            instance.meshInstance.setParameter('paintPreviewMode', this.paintPreviewMode);
             material.update();
         };
 
@@ -296,6 +315,7 @@ class Splat extends Element {
         this.transformTexture.destroy();
         this.soloMaskTexture.destroy();
         this.desaturateMaskTexture.destroy();
+        this.paintShMaskTexture.destroy();
         this.emptyPaintTexture.destroy();
         this.entity.destroy();
         this.asset.registry.remove(this.asset);
@@ -369,14 +389,21 @@ class Splat extends Element {
         }
     }
 
-    setPaintTexture(texture: Texture | null) {
-        if (this.paintTexture === texture) return;
+    setPaintTexture(texture: Texture | null, previewMode = 0, eraseTargetTexture: Texture | null = null) {
+        const nextPreviewMode = texture ? previewMode : 0;
+        const nextEraseTargetTexture = texture ? eraseTargetTexture : null;
+        if (this.paintTexture === texture && this.paintPreviewMode === nextPreviewMode &&
+            this.paintEraseTargetTexture === nextEraseTargetTexture) return;
         this.paintTexture = texture;
+        this.paintPreviewMode = nextPreviewMode;
+        this.paintEraseTargetTexture = nextEraseTargetTexture;
 
         const instance = this.entity.gsplat.instance;
         const { material } = instance;
         material.setDefine('PAINT_ENABLED', texture ? '1' : '0');
         instance.meshInstance.setParameter('paintColor', texture ?? this.emptyPaintTexture);
+        instance.meshInstance.setParameter('paintEraseTarget', nextEraseTargetTexture ?? this.emptyPaintTexture);
+        instance.meshInstance.setParameter('paintPreviewMode', nextPreviewMode);
         material.update();
         if (this.scene) this.scene.forceRender = true;
     }
@@ -405,6 +432,21 @@ class Splat extends Element {
             this.scene.forceRender = true;
             this.scene.events.fire('splat.paintChanged', this);
         }
+    }
+
+    applyPaintShMaskValues(indices: Uint32Array, values: Uint8Array) {
+        if (values.length !== indices.length) {
+            throw new Error('Paint SH mask values must contain one byte per splat.');
+        }
+
+        for (let i = 0; i < indices.length; ++i) {
+            const splatIndex = indices[i];
+            if (splatIndex < this.paintShMaskData.length) this.paintShMaskData[splatIndex] = values[i];
+        }
+        const buffer = this.paintShMaskTexture.lock() as Uint8Array;
+        buffer.set(this.paintShMaskData);
+        this.paintShMaskTexture.unlock();
+        if (this.scene) this.scene.forceRender = true;
     }
 
     async applyStateValues(indices: Uint32Array, values: Uint8Array) {
@@ -436,13 +478,18 @@ class Splat extends Element {
         const oldTransformTexture = this.transformTexture;
         const oldSoloMaskTexture = this.soloMaskTexture;
         const oldDesaturateMaskTexture = this.desaturateMaskTexture;
+        const oldPaintShMaskTexture = this.paintShMaskTexture;
+        const oldPaintShMaskData = this.paintShMaskData;
         const newResource = new GSplatResource(oldResource.device, data);
         const newStateTexture = this.createPerSplatTexture('splatState', PIXELFORMAT_R8, newResource);
         const newTransformTexture = this.createPerSplatTexture('splatTransform', PIXELFORMAT_R16U, newResource);
         const newSoloMaskTexture = this.createPerSplatTexture('soloMask', PIXELFORMAT_R8, newResource);
         const newDesaturateMaskTexture = this.createPerSplatTexture('desaturateMask', PIXELFORMAT_R8, newResource);
+        const newPaintShMaskTexture = this.createPerSplatTexture('paintShMask', PIXELFORMAT_R8, newResource);
 
         this.paintTexture = null;
+        this.paintEraseTargetTexture = null;
+        this.paintPreviewMode = 0;
         this.splatData = data;
         this.stateTexture = newStateTexture;
         this.state = new SplatState(data.getProp('state') as Uint8Array, newStateTexture);
@@ -451,6 +498,9 @@ class Splat extends Element {
         this.soloMaskData = new Uint8Array(soloMask.subarray(0, data.numSplats));
         this.desaturateMaskTexture = newDesaturateMaskTexture;
         this.desaturateMaskData = new Uint8Array(desaturateMask.subarray(0, data.numSplats));
+        this.paintShMaskTexture = newPaintShMaskTexture;
+        this.paintShMaskData = new Uint8Array(data.numSplats);
+        this.paintShMaskData.set(oldPaintShMaskData.subarray(0, data.numSplats));
 
         const transformBuffer = newTransformTexture.lock() as Uint16Array;
         transformBuffer.set(transformIndices.subarray(0, data.numSplats));
@@ -463,6 +513,10 @@ class Splat extends Element {
         desaturateBuffer.fill(0);
         desaturateBuffer.set(this.desaturateMaskData);
         newDesaturateMaskTexture.unlock();
+        const paintShMaskBuffer = newPaintShMaskTexture.lock() as Uint8Array;
+        paintShMaskBuffer.fill(0);
+        paintShMaskBuffer.set(this.paintShMaskData);
+        newPaintShMaskTexture.unlock();
 
         // A direct component resource keeps the same Splat and entity while
         // forcing PlayCanvas to rebuild its fixed-size GSplatInstance.
@@ -477,6 +531,7 @@ class Splat extends Element {
         oldTransformTexture.destroy();
         oldSoloMaskTexture.destroy();
         oldDesaturateMaskTexture.destroy();
+        oldPaintShMaskTexture.destroy();
         oldResource.destroy();
 
         this.markSaveDirty();

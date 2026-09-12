@@ -89,6 +89,10 @@ class Picker {
         this.idRenderTarget = idRT;
     }
 
+    get depthTexture() {
+        return this.depthRenderTarget?.colorBuffer ?? null;
+    }
+
     // Prepare for ID picking by rendering the specified splat
     prepareId(splat: Splat, mode: 'add' | 'remove' | 'set', alphaThreshold = 0) {
         if (!this.idRenderTarget) {

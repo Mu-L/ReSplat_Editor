@@ -1,18 +1,44 @@
-import { Button, Container, Label, NumericInput } from '@playcanvas/pcui';
+import { Button, Container, Element, Label, NumericInput } from '@playcanvas/pcui';
 import { Asset, Color, GSplatResource, Mat4, Quat, Vec3 } from 'playcanvas';
 
-import { invSigmoid } from '../color-grade';
+import { invSigmoid, sigmoid } from '../color-grade';
 import { shrinkwrapImageGSplatData } from '../decal-shrinkwrap';
 import { AddSplatOp, BitOp, DecalSubdividePaintOp, EditOp, MultiOp, PaintEraseOp, PaintStrokeOp, StateOp } from '../edit-ops';
 import { Events } from '../events';
 import { downsampleDimensions, imagePixelsToGSplatData } from '../image-import';
 import { IndexRanges, sortedPredicate } from '../index-ranges';
+import {
+    PaintDiagnosticSampleCollector,
+    buildPaintDiagnostic,
+    classifyPaintSources,
+    paintDiagnosticFilename,
+    selectEvenlySpacedIds,
+    type PaintDiagnosticContext,
+    type PaintDiagnosticGaussian,
+    type PaintDiagnosticSample,
+    type PaintDiagnosticSource,
+    type PaintDiagnosticStatus,
+    type PaintSourceClassification
+} from '../paint-diagnostic';
 import { PaintParameterAdjustmentAxis, paintParameterAdjustment } from '../paint-parameter-adjustment';
 import { calculateDecalCoverageStrength, visitDistinctPaintPickIds } from '../paint-pick';
+import {
+    PAINT_FRONT_DEPTH_TOLERANCE_RATIO,
+    paintFrontDepthTolerance,
+    screenPaintCoverageStrength,
+    screenPaintInterpolationSteps
+} from '../paint-screen-selection';
 import { Scene } from '../scene';
 import { shrinkwrapSplatOpacity } from '../shrinkwrap-opacity';
 import { Splat } from '../splat';
-import { PaintSettings, SplatPaintRuntime } from '../splat-paint';
+import {
+    PaintSettings,
+    SplatPaintRuntime,
+    type PaintCommitDiagnostic,
+    type PaintErasePreview,
+    type PaintPreviewMode,
+    type PaintStrokeDelta
+} from '../splat-paint';
 import { State } from '../splat-state';
 import {
     DecalSubdivisionResult,
@@ -29,12 +55,31 @@ type BrushPaintToolName = 'brush' | 'eraser';
 type PaintToolName = BrushPaintToolName | 'eyedropper' | 'decal';
 type DecalMode = 'subdivide' | 'shrinkwrap';
 type BrushStrokeSettings = Omit<PaintSettings, 'radius'> & { radiusPixels: number };
+type ActivePaintDiagnostic = {
+    createdAt: string;
+    startedAt: number;
+    target: Splat;
+    context: PaintDiagnosticContext;
+    samples: PaintDiagnosticSampleCollector;
+    nextSampleSequence: number;
+    inputEvents: number;
+    coalescedInputEvents: number;
+    queueDrainMs: number;
+    sampleTotals: {
+        target: number;
+        miss: number;
+        otherSplat: number;
+        paintThroughBehindSurface: number;
+        maximumPaintThroughDepthBehindSurface: number;
+    };
+};
 
 // Ignore fragments that contribute less than 20% opacity while painting. This lets
 // brush/decal interaction pass through sparse, nearly transparent stray gaussians.
 const paintPickAlphaThreshold = 0.2;
-// Keep effectively visible fragments in a second ID layer so the low-alpha
-// gaussians that painting passes through still receive the same color.
+// Decal projection keeps a second, low-alpha ID layer so visible feathered
+// Gaussian footprints can receive the decal without changing brush/eraser
+// front-surface selection.
 const paintThroughAlphaThreshold = 1 / 255;
 const decalCoverageCutoff = 0.02;
 const decalCoveragePaddingPixels = 8;
@@ -102,8 +147,12 @@ class PaintTool {
         let strokeAttachedSplats = new Set<Splat>();
         let strokeEraseRuntimes = new Map<Splat, SplatPaintRuntime>();
         let queuedPoint: NormalizedPoint | null = null;
+        let queuedPointEnqueuedAtMs = 0;
         let processing = false;
         let processingPromise: Promise<void> = Promise.resolve();
+        let diagnosticRecording = false;
+        let activeDiagnostic: ActivePaintDiagnostic | null = null;
+        let lastDiagnostic: ReturnType<typeof buildPaintDiagnostic> | null = null;
         let parameterAdjustment: {
             pointerId: number,
             kind: 'strength' | 'hardness' | 'radius',
@@ -112,8 +161,8 @@ class PaintTool {
             startY: number,
             startValue: number
         } | null = null;
-        let lastModelPoint: Vec3 | null = null;
-        let lastModelRadius = 0;
+        let lastScreenPoint: NormalizedPoint | null = null;
+        let lastScreenDepthTolerance = 0;
         let lastPaintSplat: Splat | null = null;
         let updatingRadiusInput = false;
         let brushRadiusPixels = 10;
@@ -154,11 +203,15 @@ class PaintTool {
 
         const inverseWorld = new Mat4();
         const modelPoint = new Vec3();
-        const interpolated = new Vec3();
         const cursorWorld = new Vec3();
         const cursorAxisWorld = new Vec3();
         const cursorScreen = new Vec3();
         const cursorAxisScreen = new Vec3();
+        const paintWorldScale = new Vec3();
+        const paintViewProjection = new Mat4();
+        const diagnosticModelPoint = new Vec3();
+        const diagnosticWorldPoint = new Vec3();
+        const diagnosticDelta = new Vec3();
 
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         svg.classList.add('tool-svg', 'hidden');
@@ -219,7 +272,8 @@ class PaintTool {
 
         const updateCursorGradient = () => {
             const hardnessPercent = clamp(hardness, 0, 1) * 100;
-            const strengthOpacity = clamp(strength, 0, 1) * 0.28;
+            const cursorStrength = activePaintTool === 'brush' ? screenPaintCoverageStrength(strength) : strength;
+            const strengthOpacity = clamp(cursorStrength, 0, 1) * 0.28;
             const color = isBrushPaintTool(activePaintTool) && parameterAdjustment ? '#ff0000' :
                 activePaintTool === 'eraser' ? '#ffffff' : colorToHex(paintColor);
             gradientCenter.setAttribute('offset', '0%');
@@ -370,6 +424,46 @@ class PaintTool {
             width: 52
         });
 
+        const diagnosticSeparator = new Element({ class: 'select-toolbar-separator' });
+        const diagnosticRecordButton = new Button({
+            text: localize('toolbar.paint.diagnostic.record'),
+            width: 82,
+            class: 'select-toolbar-button'
+        });
+        const diagnosticExportButton = new Button({
+            text: localize('toolbar.paint.diagnostic.export'),
+            width: 82,
+            class: 'select-toolbar-button'
+        });
+
+        const exportLastDiagnostic = () => {
+            if (!lastDiagnostic) return;
+            const json = JSON.stringify(lastDiagnostic, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = paintDiagnosticFilename(lastDiagnostic.context.splat.filename, lastDiagnostic.createdAt);
+            link.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        };
+
+        const updateDiagnosticButtonState = () => {
+            const visible = activePaintTool === 'brush';
+            diagnosticSeparator.hidden = !visible;
+            diagnosticRecordButton.hidden = !visible;
+            diagnosticExportButton.hidden = !visible;
+            diagnosticRecordButton.dom.classList.toggle('active', diagnosticRecording);
+            diagnosticRecordButton.enabled = visible && !strokeActive && !committing;
+            diagnosticExportButton.enabled = visible && !strokeActive && !committing && lastDiagnostic !== null;
+        };
+
+        diagnosticRecordButton.on('click', () => {
+            diagnosticRecording = !diagnosticRecording;
+            updateDiagnosticButtonState();
+        });
+        diagnosticExportButton.on('click', exportLastDiagnostic);
+
         const decalImportButton = new Button({
             class: ['select-toolbar-button', 'paint-decal-import-button'],
             text: localize('paint.decal.import')
@@ -437,6 +531,9 @@ class PaintTool {
         toolbar.append(hardnessInput);
         toolbar.append(radiusLabel);
         toolbar.append(radiusInput);
+        toolbar.append(diagnosticSeparator);
+        toolbar.append(diagnosticRecordButton);
+        toolbar.append(diagnosticExportButton);
         toolbar.append(decalImportButton);
         toolbar.dom.appendChild(decalFileInput);
         toolbar.dom.appendChild(decalToolbarPreview);
@@ -609,6 +706,7 @@ class PaintTool {
             decalSubdivisionInput.hidden = !decal;
             cursor.style.display = brushTool ? '' : 'none';
             decalCursor.classList.add('hidden');
+            updateDiagnosticButtonState();
         };
         updatePaintToolbar(activePaintTool);
 
@@ -630,14 +728,253 @@ class PaintTool {
             cursor.setAttribute('r', brushRadiusPixels.toString());
         };
 
-        const getRuntime = (splat: Splat, previewEnabled = true) => {
+        const getRuntime = (
+            splat: Splat,
+            previewEnabled = true,
+            previewMode: PaintPreviewMode = 'paint'
+        ) => {
             let runtime = this.runtimes.get(splat);
             if (!runtime) {
                 runtime = new SplatPaintRuntime(splat);
                 this.runtimes.set(splat, runtime);
             }
+            runtime.setPreviewMode(previewMode);
             runtime.setPreviewEnabled(previewEnabled);
             return runtime;
+        };
+
+        const diagnosticNumber = (value: number) => (Number.isFinite(value) ? Number(value.toFixed(6)) : 0);
+        const diagnosticVec3 = (value: Vec3): [number, number, number] => [
+            diagnosticNumber(value.x),
+            diagnosticNumber(value.y),
+            diagnosticNumber(value.z)
+        ];
+        const diagnosticSplatInfo = (splat: Splat) => {
+            const resource = splat.asset.resource as GSplatResource;
+            return {
+                filename: splat.filename || splat.name || 'scene',
+                name: splat.name || splat.filename || 'Splat',
+                gaussianCount: splat.splatData.numSplats,
+                availableSphericalHarmonicBands: resource.shBands,
+                activeSphericalHarmonicBands: events.functions.has('view.bands') ?
+                    events.invoke('view.bands') as number : resource.shBands
+            };
+        };
+
+        const snapshotDiagnosticContext = (
+            target: Splat,
+            settings: BrushStrokeSettings,
+            layerId: string | null
+        ): PaintDiagnosticContext => {
+            const state = target.state.data;
+            const solo = target.soloMaskData;
+            const independent = target.desaturateMaskData;
+            let selected = 0;
+            let locked = 0;
+            let deleted = 0;
+            let soloHidden = 0;
+            let independentlyEdited = 0;
+            let spherePaintEligible = 0;
+            let idPickEligible = 0;
+            for (let index = 0; index < target.splatData.numSplats; index++) {
+                const value = state[index] ?? 0;
+                const soloVisible = (solo[index] ?? 255) >= 128;
+                const edited = (independent[index] ?? 0) >= 128;
+                const editable = (value & (State.locked | State.deleted)) === 0 && soloVisible;
+                if ((value & State.selected) !== 0) selected++;
+                if ((value & State.locked) !== 0) locked++;
+                if ((value & State.deleted) !== 0) deleted++;
+                if (!soloVisible) soloHidden++;
+                if (edited) independentlyEdited++;
+                if (editable) spherePaintEligible++;
+                if (editable && !edited) idPickEligible++;
+            }
+
+            const layers = events.functions.has('paint.layers.list') ?
+                events.invoke('paint.layers.list') as Array<{
+                    id: string,
+                    name?: string,
+                    visible?: boolean,
+                    opacity?: number,
+                    blendMode?: string
+                }> : [];
+            const layer = layers.find(candidate => candidate.id === layerId);
+            const rect = parent.getBoundingClientRect();
+            const graphicsDevice = scene.graphicsDevice;
+            return {
+                splat: diagnosticSplatInfo(target),
+                layer: {
+                    id: layerId,
+                    name: layer?.name ?? null,
+                    visible: layer?.visible ?? (events.functions.has('paint.layers.activeVisible') ?
+                        !!events.invoke('paint.layers.activeVisible') : true),
+                    opacity: typeof layer?.opacity === 'number' ? layer.opacity : null,
+                    blendMode: layer?.blendMode ?? null
+                },
+                brush: {
+                    color: [settings.color.r, settings.color.g, settings.color.b, settings.color.a],
+                    strength: settings.strength,
+                    effectiveStrength: screenPaintCoverageStrength(settings.strength),
+                    hardness: settings.hardness,
+                    radiusPixels: settings.radiusPixels,
+                    selectionMode: 'screenCircleFrontSurface',
+                    frontSurfaceDepthToleranceRatio: PAINT_FRONT_DEPTH_TOLERANCE_RATIO
+                },
+                picking: {
+                    surfaceAlphaThreshold: paintPickAlphaThreshold,
+                    paintThroughAlphaThreshold,
+                    paintThroughEnabled: false,
+                    frontVisibleFootprintSupplementEnabled: false
+                },
+                camera: {
+                    position: diagnosticVec3(scene.camera.position),
+                    forward: diagnosticVec3(scene.camera.forward),
+                    focalPoint: diagnosticVec3(scene.camera.focalPoint),
+                    fovDegrees: scene.camera.fov,
+                    orthographic: scene.camera.ortho,
+                    nearClip: scene.camera.near,
+                    farClip: scene.camera.far
+                },
+                viewport: {
+                    cssWidth: diagnosticNumber(rect.width),
+                    cssHeight: diagnosticNumber(rect.height),
+                    renderWidth: scene.targetSize.width,
+                    renderHeight: scene.targetSize.height,
+                    devicePixelRatio: window.devicePixelRatio,
+                    graphicsBackend: graphicsDevice.deviceType
+                },
+                target: {
+                    worldTransformColumnMajor: Array.from(target.worldTransform.data, value => diagnosticNumber(value)),
+                    localBounds: {
+                        center: diagnosticVec3(target.localBound.center),
+                        halfExtents: diagnosticVec3(target.localBound.halfExtents)
+                    },
+                    worldBounds: {
+                        center: diagnosticVec3(target.worldBound.center),
+                        halfExtents: diagnosticVec3(target.worldBound.halfExtents)
+                    },
+                    gaussianStates: {
+                        total: target.splatData.numSplats,
+                        selected,
+                        locked,
+                        deleted,
+                        soloHidden,
+                        independentlyEdited,
+                        spherePaintEligible,
+                        idPickEligible
+                    }
+                }
+            };
+        };
+
+        const snapshotDiagnosticGaussian = (
+            splat: Splat,
+            id: number,
+            source: PaintDiagnosticGaussian['source']
+        ): PaintDiagnosticGaussian | null => {
+            if (id < 0 || id >= splat.splatData.numSplats) return null;
+            const centers = splat.entity.gsplat.instance.sorter.centers;
+            const base = id * 3;
+            diagnosticModelPoint.set(centers[base], centers[base + 1], centers[base + 2]);
+            splat.worldTransform.transformPoint(diagnosticModelPoint, diagnosticWorldPoint);
+            diagnosticDelta.sub2(diagnosticWorldPoint, scene.camera.position);
+            const opacity = splat.splatData.getProp('opacity') as Float32Array | undefined;
+            const rawState = splat.state.data[id] ?? 0;
+            return {
+                id,
+                source,
+                modelPosition: diagnosticVec3(diagnosticModelPoint),
+                worldPosition: diagnosticVec3(diagnosticWorldPoint),
+                cameraDepth: diagnosticNumber(diagnosticDelta.dot(scene.camera.forward)),
+                opacity: opacity ? diagnosticNumber(sigmoid(opacity[id])) : null,
+                state: {
+                    raw: rawState,
+                    selected: (rawState & State.selected) !== 0,
+                    locked: (rawState & State.locked) !== 0,
+                    deleted: (rawState & State.deleted) !== 0
+                },
+                soloVisible: (splat.soloMaskData[id] ?? 255) >= 128,
+                independentlyEdited: (splat.desaturateMaskData[id] ?? 0) >= 128
+            };
+        };
+
+        const representativeGaussians = (target: Splat, classification: PaintSourceClassification) => {
+            const sources: PaintDiagnosticSource[] = ['sphereOnly', 'paintThroughOnly', 'overlap', 'unclassified'];
+            return Object.fromEntries(sources.map(source => [
+                source,
+                selectEvenlySpacedIds(classification[source], 128)
+                .map(id => snapshotDiagnosticGaussian(target, id, source))
+                .filter((value): value is PaintDiagnosticGaussian => value !== null)
+            ])) as Record<PaintDiagnosticSource, PaintDiagnosticGaussian[]>;
+        };
+
+        const startPaintDiagnostic = (target: Splat, settings: BrushStrokeSettings, layerId: string | null) => {
+            if (!diagnosticRecording || activePaintTool !== 'brush') return;
+            activeDiagnostic = {
+                createdAt: new Date().toISOString(),
+                startedAt: performance.now(),
+                target,
+                context: snapshotDiagnosticContext(target, settings, layerId),
+                samples: new PaintDiagnosticSampleCollector(500),
+                nextSampleSequence: 0,
+                inputEvents: 0,
+                coalescedInputEvents: 0,
+                queueDrainMs: 0,
+                sampleTotals: {
+                    target: 0,
+                    miss: 0,
+                    otherSplat: 0,
+                    paintThroughBehindSurface: 0,
+                    maximumPaintThroughDepthBehindSurface: 0
+                }
+            };
+            updateDiagnosticButtonState();
+        };
+
+        const finishPaintDiagnostic = (
+            status: PaintDiagnosticStatus,
+            options: {
+                reason?: string,
+                error?: unknown,
+                delta?: PaintStrokeDelta | null,
+                runtime?: PaintCommitDiagnostic,
+                commitMs?: number
+            } = {}
+        ) => {
+            const diagnostic = activeDiagnostic;
+            if (!diagnostic) return;
+            activeDiagnostic = null;
+            const samples = diagnostic.samples.snapshot();
+            const classification = classifyPaintSources(
+                options.delta?.indices ?? [],
+                options.runtime?.sphereIndices ?? [],
+                options.runtime?.paintThroughIndices ?? [],
+                options.runtime?.frontVisibleIndices ?? []
+            );
+            lastDiagnostic = buildPaintDiagnostic({
+                createdAt: diagnostic.createdAt,
+                completedAt: new Date().toISOString(),
+                status,
+                reason: options.reason,
+                error: options.error instanceof Error ? options.error.message :
+                    (options.error === undefined ? undefined : String(options.error)),
+                context: diagnostic.context,
+                inputEvents: diagnostic.inputEvents,
+                coalescedInputEvents: diagnostic.coalescedInputEvents,
+                samples: samples.retained,
+                totalSamples: samples.total,
+                sampleTotals: diagnostic.sampleTotals,
+                sourceClassification: classification,
+                representativeGaussians: representativeGaussians(diagnostic.target, classification),
+                performance: {
+                    queueDrainMs: diagnostic.queueDrainMs,
+                    commitMs: options.commitMs ?? 0,
+                    gpuReadbackMs: options.runtime?.timings.gpuReadbackMs ?? 0,
+                    commitCpuMs: options.runtime?.timings.commitCpuMs ?? 0,
+                    totalStrokeMs: performance.now() - diagnostic.startedAt
+                }
+            });
+            updateDiagnosticButtonState();
         };
 
         const destroyRuntime = (splat: Splat) => {
@@ -716,73 +1053,178 @@ class PaintTool {
             syncBrushRadiusUi();
         };
 
-        const processPoint = async (point: NormalizedPoint, generation: number) => {
+        const processPoint = async (point: NormalizedPoint, generation: number, enqueuedAtMs: number) => {
+            const diagnostic = activeDiagnostic;
+            const sampleStart = performance.now();
+            const sample: PaintDiagnosticSample | null = diagnostic ? {
+                sequence: diagnostic.nextSampleSequence++,
+                screen: { ...point },
+                enqueuedAtMs,
+                startedAtMs: sampleStart - diagnostic.startedAt,
+                completedAtMs: 0,
+                outcome: 'miss',
+                surface: { kind: 'miss' },
+                timings: { depthPickMs: 0, idReadbackMs: 0, processingMs: 0 }
+            } : null;
+            const completeDiagnosticSample = () => {
+                if (!diagnostic || !sample || activeDiagnostic !== diagnostic) return;
+                sample.completedAtMs = performance.now() - diagnostic.startedAt;
+                sample.timings.processingMs = performance.now() - sampleStart;
+                if (sample.surface.kind === 'target') diagnostic.sampleTotals.target++;
+                if (sample.surface.kind === 'miss') diagnostic.sampleTotals.miss++;
+                if (sample.surface.kind === 'other-splat') diagnostic.sampleTotals.otherSplat++;
+                const depthBehindSurface = sample.paintThrough?.depthBehindSurface ?? 0;
+                if (depthBehindSurface > 1e-6) {
+                    diagnostic.sampleTotals.paintThroughBehindSurface++;
+                    diagnostic.sampleTotals.maximumPaintThroughDepthBehindSurface = Math.max(
+                        diagnostic.sampleTotals.maximumPaintThroughDepthBehindSurface,
+                        depthBehindSurface
+                    );
+                }
+                diagnostic.samples.add(sample);
+            };
             const eraseCandidates = strokeTool === 'eraser' && strokeTarget ?
                 [strokeTarget, ...strokeAttachedSplats] : undefined;
+            const depthPickStart = performance.now();
             const hit = await scene.camera.intersect(
                 point.x,
                 point.y,
-                eraseCandidates ? paintThroughAlphaThreshold : paintPickAlphaThreshold,
-                eraseCandidates
+                paintPickAlphaThreshold,
+                eraseCandidates,
+                true
             );
+            if (sample) sample.timings.depthPickMs = performance.now() - depthPickStart;
             if (generation !== strokeGeneration || !strokeActive || !strokeTarget || !strokeRuntime || !strokeSettings || !strokeTool ||
                 getTarget() !== strokeTarget) return;
             const target = strokeTarget;
             const paintSplat = hit?.splat;
             const attachedEraseTarget = strokeTool === 'eraser' && paintSplat && strokeAttachedSplats.has(paintSplat);
             if (!paintSplat || (paintSplat !== target && !attachedEraseTarget)) {
-                lastModelPoint = null;
-                lastModelRadius = 0;
+                if (sample) {
+                    sample.outcome = paintSplat ? 'other-splat' : 'miss';
+                    sample.surface = paintSplat ? {
+                        kind: 'other-splat',
+                        splat: diagnosticSplatInfo(paintSplat),
+                        worldPosition: hit ? diagnosticVec3(hit.position) : undefined,
+                        distanceFromCamera: hit?.distance
+                    } : { kind: 'miss' };
+                }
+                lastScreenPoint = null;
+                lastScreenDepthTolerance = 0;
                 lastPaintSplat = null;
+                completeDiagnosticSample();
                 return;
             }
 
             let runtime = paintSplat === target ? strokeRuntime : strokeEraseRuntimes.get(paintSplat);
             if (!runtime) {
-                runtime = getRuntime(paintSplat, false);
+                runtime = getRuntime(paintSplat, true, paintSplat === target ? 'erase-color' : 'erase-opacity');
                 strokeEraseRuntimes.set(paintSplat, runtime);
             }
             const settings = strokeSettings;
-            scene.camera.pickPrep(paintSplat, 'set', paintThroughAlphaThreshold);
-            const paintThroughId = await scene.camera.pick(point.x, point.y);
             const runtimeStillActive = paintSplat === target ? strokeRuntime === runtime :
                 strokeEraseRuntimes.get(paintSplat) === runtime;
             if (generation !== strokeGeneration || !strokeActive || strokeTarget !== target || !runtimeStillActive ||
                 strokeSettings !== settings || getTarget() !== target) return;
 
             if (lastPaintSplat !== paintSplat) {
-                lastModelPoint = null;
-                lastModelRadius = 0;
+                lastScreenPoint = null;
+                lastScreenDepthTolerance = 0;
             }
             inverseWorld.copy(paintSplat.worldTransform).invert();
             inverseWorld.transformPoint(hit.position, modelPoint);
             const modelRadius = modelRadiusForScreenRadius(paintSplat, modelPoint, settings.radiusPixels);
-            const paintSettings: PaintSettings = {
-                color: settings.color,
-                strength: settings.strength,
-                hardness: settings.hardness,
-                radius: modelRadius
-            };
+            let interpolationSteps = 1;
+            let frontSurfaceDepthTolerance: number | undefined;
+            if (isBrushPaintTool(strokeTool)) {
+                const frontDepthTexture = hit.frontDepthTexture;
+                if (!frontDepthTexture) {
+                    lastScreenPoint = null;
+                    lastScreenDepthTolerance = 0;
+                    lastPaintSplat = null;
+                    completeDiagnosticSample();
+                    return;
+                }
 
-            if (lastModelPoint) {
-                const distance = lastModelPoint.distance(modelPoint);
-                const spacingRadius = Math.min(lastModelRadius || modelRadius, modelRadius);
-                const steps = Math.max(1, Math.ceil(distance / Math.max(spacingRadius * 0.5, 1e-8)));
+                paintSplat.worldTransform.getScale(paintWorldScale);
+                const maximumWorldScale = Math.max(
+                    Math.abs(paintWorldScale.x),
+                    Math.abs(paintWorldScale.y),
+                    Math.abs(paintWorldScale.z)
+                );
+                const depthTolerance = paintFrontDepthTolerance(modelRadius * maximumWorldScale);
+                frontSurfaceDepthTolerance = depthTolerance;
+                const viewportWidth = parent.offsetWidth || 1;
+                const viewportHeight = parent.offsetHeight || 1;
+                paintViewProjection.mul2(scene.camera.camera.projectionMatrix, scene.camera.camera.viewMatrix);
+                const steps = lastScreenPoint ? screenPaintInterpolationSteps(
+                    lastScreenPoint,
+                    point,
+                    settings.radiusPixels,
+                    viewportWidth,
+                    viewportHeight
+                ) : 1;
+                interpolationSteps = steps;
                 for (let i = 1; i <= steps; ++i) {
                     const t = i / steps;
-                    interpolated.lerp(lastModelPoint, modelPoint, t);
-                    paintSettings.radius = lastModelRadius + (modelRadius - lastModelRadius) * t;
-                    runtime.paintSphere(interpolated, paintSettings);
+                    const x = lastScreenPoint ? lastScreenPoint.x + (point.x - lastScreenPoint.x) * t : point.x;
+                    const y = lastScreenPoint ? lastScreenPoint.y + (point.y - lastScreenPoint.y) * t : point.y;
+                    const interpolatedDepthTolerance = lastScreenPoint ?
+                        lastScreenDepthTolerance + (depthTolerance - lastScreenDepthTolerance) * t : depthTolerance;
+                    runtime.paintScreenCircle({
+                        x,
+                        y,
+                        radiusPixels: settings.radiusPixels,
+                        viewportWidth,
+                        viewportHeight,
+                        depthTolerance: interpolatedDepthTolerance,
+                        nearClip: scene.camera.near,
+                        farClip: scene.camera.far,
+                        frontDepthTexture,
+                        viewMatrix: scene.camera.camera.viewMatrix,
+                        viewProjectionMatrix: paintViewProjection,
+                        color: settings.color,
+                        strength: screenPaintCoverageStrength(settings.strength),
+                        hardness: settings.hardness
+                    });
                 }
-            } else {
-                runtime.paintSphere(modelPoint, paintSettings);
             }
-            runtime.queuePaintSample(paintThroughId, settings.color, settings.strength);
 
-            if (!lastModelPoint) lastModelPoint = new Vec3();
-            lastModelPoint.copy(modelPoint);
-            lastModelRadius = modelRadius;
+            if (sample && diagnostic && strokeTool === 'brush') {
+                sample.outcome = 'painted';
+                sample.surface = {
+                    kind: 'target',
+                    splat: diagnosticSplatInfo(paintSplat),
+                    worldPosition: diagnosticVec3(hit.position),
+                    modelPosition: diagnosticVec3(modelPoint),
+                    distanceFromCamera: diagnosticNumber(hit.distance)
+                };
+                sample.brush = {
+                    radiusPixels: settings.radiusPixels,
+                    modelRadius: diagnosticNumber(modelRadius),
+                    interpolationSteps,
+                    frontSurfaceDepthToleranceWorldUnits: frontSurfaceDepthTolerance === undefined ? undefined :
+                        diagnosticNumber(frontSurfaceDepthTolerance)
+                };
+                sample.paintThrough = {
+                    id: null,
+                    queued: false
+                };
+            }
+
+            lastScreenPoint = { ...point };
+            if (isBrushPaintTool(strokeTool)) {
+                paintSplat.worldTransform.getScale(paintWorldScale);
+                lastScreenDepthTolerance = paintFrontDepthTolerance(modelRadius * Math.max(
+                    Math.abs(paintWorldScale.x),
+                    Math.abs(paintWorldScale.y),
+                    Math.abs(paintWorldScale.z)
+                ));
+            } else {
+                lastScreenDepthTolerance = 0;
+            }
             lastPaintSplat = paintSplat;
+            completeDiagnosticSample();
         };
 
         const pumpQueue = async (generation: number) => {
@@ -791,8 +1233,10 @@ class PaintTool {
                 for (;;) {
                     if (!queuedPoint || generation !== strokeGeneration || !strokeActive) break;
                     const point = queuedPoint;
+                    const enqueuedAtMs = queuedPointEnqueuedAtMs;
                     queuedPoint = null;
-                    await processPoint(point, generation);
+                    queuedPointEnqueuedAtMs = 0;
+                    await processPoint(point, generation, enqueuedAtMs);
                 }
             } finally {
                 processing = false;
@@ -800,6 +1244,13 @@ class PaintTool {
         };
 
         const enqueuePoint = (point: NormalizedPoint) => {
+            if (activeDiagnostic) {
+                activeDiagnostic.inputEvents++;
+                if (queuedPoint) activeDiagnostic.coalescedInputEvents++;
+                queuedPointEnqueuedAtMs = performance.now() - activeDiagnostic.startedAt;
+            } else {
+                queuedPointEnqueuedAtMs = 0;
+            }
             queuedPoint = point;
             if (!processing) {
                 processingPromise = pumpQueue(strokeGeneration);
@@ -822,12 +1273,13 @@ class PaintTool {
             pointerId = null;
         };
 
-        const cancelStroke = () => {
+        const cancelStroke = (reason = 'stroke-cancelled', error?: unknown) => {
             strokeGeneration++;
             queuedPoint = null;
+            queuedPointEnqueuedAtMs = 0;
             strokeActive = false;
-            lastModelPoint = null;
-            lastModelRadius = 0;
+            lastScreenPoint = null;
+            lastScreenDepthTolerance = 0;
             lastPaintSplat = null;
             releasePointer();
             strokeRuntime?.clear();
@@ -839,6 +1291,8 @@ class PaintTool {
             strokeLayerId = null;
             strokeAttachedSplats.clear();
             strokeEraseRuntimes.clear();
+            finishPaintDiagnostic(error === undefined ? 'cancelled' : 'error', { reason, error });
+            updateDiagnosticButtonState();
         };
 
         const wrapPaintOperation = (op: EditOp, layerId?: string | null) => {
@@ -857,6 +1311,7 @@ class PaintTool {
             decalSizeInput.enabled = !value;
             decalSubdivisionInput.enabled = !value;
             events.fire('paint.busy', value);
+            updateDiagnosticButtonState();
         };
 
         const stampDecal = async (point: NormalizedPoint) => {
@@ -1340,9 +1795,10 @@ class PaintTool {
             if (!enabled) return;
 
             const isPaintPointer = event.pointerType === 'mouse' ? event.button === 0 : event.isPrimary;
-            const isMiddlePick = event.pointerType === 'mouse' && event.button === 1 && event.shiftKey &&
-                !isBrushPaintTool(activePaintTool) &&
-                (!event.altKey || activePaintTool !== 'decal');
+            // Shift + middle mouse temporarily samples color from any paint tool.
+            // Alt + middle mouse remains available for hardness/feather adjustment.
+            const isMiddlePick = event.pointerType === 'mouse' && event.button === 1 &&
+                event.shiftKey && !event.altKey;
 
             // The brush owns the primary pointer for the entire paint mode,
             // even when there is currently no valid Gaussian target. Consume
@@ -1366,8 +1822,26 @@ class PaintTool {
 
             if ((isBrushPaintTool(activePaintTool) || activePaintTool === 'decal') && parameterAdjustmentPointerDown(event)) return;
             if (!isPaintPointer) return;
-            if ((isBrushPaintTool(activePaintTool) || activePaintTool === 'decal') &&
-                events.functions.has('paint.layers.activeVisible') && !events.invoke('paint.layers.activeVisible')) return;
+            const activeLayerVisible = !events.functions.has('paint.layers.activeVisible') ||
+                !!events.invoke('paint.layers.activeVisible');
+            if ((isBrushPaintTool(activePaintTool) || activePaintTool === 'decal') && !activeLayerVisible) {
+                if (activePaintTool === 'brush' && diagnosticRecording) {
+                    const target = getTarget();
+                    if (target) {
+                        const layerId = events.functions.has('paint.layers.active') ?
+                            events.invoke('paint.layers.active') as string : null;
+                        startPaintDiagnostic(target, {
+                            color: paintColor.clone(),
+                            strength,
+                            hardness,
+                            radiusPixels: brushRadiusPixels
+                        }, layerId);
+                        if (activeDiagnostic) activeDiagnostic.inputEvents = 1;
+                        finishPaintDiagnostic('empty', { reason: 'active-paint-layer-not-visible' });
+                    }
+                }
+                return;
+            }
 
             if (activePaintTool === 'decal') {
                 event.preventDefault();
@@ -1385,9 +1859,17 @@ class PaintTool {
             const target = getTarget();
             if (!target) return;
 
+            const layerId = events.functions.has('paint.layers.active') ?
+                events.invoke('paint.layers.active') as string : null;
             let runtime: SplatPaintRuntime;
             try {
-                runtime = getRuntime(target, activePaintTool !== 'eraser');
+                const previewMode: PaintPreviewMode = activePaintTool === 'eraser' ? 'erase-color' : 'paint';
+                runtime = getRuntime(target, true, previewMode);
+                if (activePaintTool === 'eraser') {
+                    const erasePreview = events.functions.has('paint.layers.erasePreview') ?
+                        events.invoke('paint.layers.erasePreview', target, layerId ?? undefined) as PaintErasePreview : null;
+                    runtime.setErasePreviewTarget(erasePreview);
+                }
             } catch (error) {
                 console.error('[Paint] Failed to initialize paint resources', error);
                 return;
@@ -1401,7 +1883,7 @@ class PaintTool {
             strokeRuntime = runtime;
             strokeRuntime.clear();
             strokeTool = activePaintTool;
-            strokeLayerId = events.functions.has('paint.layers.active') ? events.invoke('paint.layers.active') as string : null;
+            strokeLayerId = layerId;
             strokeAttachedSplats = activePaintTool === 'eraser' && events.functions.has('paint.layers.attachedSplats') ?
                 new Set(events.invoke('paint.layers.attachedSplats', strokeLayerId ?? undefined) as Splat[]) : new Set();
             strokeEraseRuntimes = new Map();
@@ -1411,10 +1893,13 @@ class PaintTool {
                 hardness,
                 radiusPixels: brushRadiusPixels
             };
-            lastModelPoint = null;
-            lastModelRadius = 0;
+            lastScreenPoint = null;
+            lastScreenDepthTolerance = 0;
             lastPaintSplat = null;
             queuedPoint = null;
+            queuedPointEnqueuedAtMs = 0;
+            startPaintDiagnostic(target, strokeSettings, strokeLayerId);
+            updateDiagnosticButtonState();
             enqueuePoint(point);
         };
 
@@ -1453,7 +1938,17 @@ class PaintTool {
             enqueuePoint(point);
             releasePointer();
             const generation = strokeGeneration;
-            await waitForSamples();
+            const queueDrainStart = performance.now();
+            try {
+                await waitForSamples();
+            } catch (error) {
+                if (generation === strokeGeneration && strokeActive) {
+                    console.error('[Paint] Failed to process stroke samples', error);
+                    cancelStroke('sample-processing-failed', error);
+                }
+                return;
+            }
+            if (activeDiagnostic) activeDiagnostic.queueDrainMs = performance.now() - queueDrainStart;
             if (generation !== strokeGeneration || !strokeActive || !strokeRuntime || !strokeTarget) return;
 
             strokeActive = false;
@@ -1470,8 +1965,8 @@ class PaintTool {
             strokeLayerId = null;
             strokeAttachedSplats = new Set();
             strokeEraseRuntimes = new Map();
-            lastModelPoint = null;
-            lastModelRadius = 0;
+            lastScreenPoint = null;
+            lastScreenDepthTolerance = 0;
             lastPaintSplat = null;
 
             setBusy(true);
@@ -1479,7 +1974,7 @@ class PaintTool {
                 if (tool === 'eraser') {
                     const operations: EditOp[] = [];
                     for (const [eraseSplat, eraseRuntime] of eraseRuntimes) {
-                        const delta = await eraseRuntime.commitErase();
+                        const delta = await eraseRuntime.commitErase({ keepPreview: true });
                         if (!delta || !eraseSplat.scene) continue;
 
                         if (eraseSplat === target) {
@@ -1505,24 +2000,48 @@ class PaintTool {
                         }
                     }
                     if (operations.length > 0) {
-                        events.fire('edit.add', operations.length === 1 ? operations[0] : new MultiOp(operations));
+                        const operation = operations.length === 1 ? operations[0] : new MultiOp(operations);
+                        await operation.do();
+                        events.fire('edit.add', operation, true);
                     }
+                    eraseRuntimes.forEach(eraseRuntime => eraseRuntime.clear());
                 } else {
-                    const delta = await runtime.commit();
+                    let delta: PaintStrokeDelta | null;
+                    let runtimeDiagnostic: PaintCommitDiagnostic | undefined;
+                    const commitStart = performance.now();
+                    if (activeDiagnostic) {
+                        const result = await runtime.commit({ collectDiagnostic: true });
+                        delta = result.delta;
+                        runtimeDiagnostic = result.diagnostic;
+                    } else {
+                        delta = await runtime.commit();
+                    }
+                    const commitMs = performance.now() - commitStart;
                     if (delta && target.scene) {
                         events.fire('edit.add', wrapPaintOperation(new PaintStrokeOp({
                             splat: target,
                             indices: delta.indices,
                             before: delta.before,
                             after: delta.after,
-                            colors: delta.colors
+                            colors: delta.colors,
+                            beforeShMask: delta.beforeShMask,
+                            afterShMask: delta.afterShMask
                         }), layerId), true);
+                        if (events.functions.has('paint.layers.recompose')) {
+                            await events.invoke('paint.layers.recompose');
+                        }
                     }
+                    finishPaintDiagnostic(delta ? 'success' : 'empty', {
+                        delta,
+                        runtime: runtimeDiagnostic,
+                        commitMs
+                    });
                 }
             } catch (error) {
                 runtime.clear();
                 eraseRuntimes.forEach(eraseRuntime => eraseRuntime.clear());
                 console.error('[Paint] Failed to commit stroke', error);
+                finishPaintDiagnostic('error', { reason: 'stroke-commit-failed', error });
             } finally {
                 setBusy(false);
                 if (!enabled) destroyRuntimes();
@@ -1542,7 +2061,7 @@ class PaintTool {
             if (event.pointerId === pointerId) {
                 event.preventDefault();
                 event.stopPropagation();
-                cancelStroke();
+                cancelStroke('pointer-cancelled');
             }
         };
 
@@ -1625,7 +2144,7 @@ class PaintTool {
         events.on('selection.changed', () => {
             // A stroke must never finish against a Gaussian that stopped being
             // the current selection while asynchronous pick samples were in flight.
-            if (enabled && strokeActive && getTarget() !== strokeTarget) cancelStroke();
+            if (enabled && strokeActive && getTarget() !== strokeTarget) cancelStroke('paint-target-changed');
         });
         events.on('paint.color.set', (value: Color | number[] | string) => {
             setPaintColor(value);
@@ -1649,10 +2168,18 @@ class PaintTool {
             processDecalImage();
             events.fire('paint.decal.mode.changed', decalMode);
         });
+        const switchPaintToolFromShortcut = (toolName: PaintToolName) => {
+            if (!enabled || committing) return;
+            events.fire('paint.tool.set', toolName);
+        };
+        events.on('paint.tool.brush', () => switchPaintToolFromShortcut('brush'));
+        events.on('paint.tool.eraser', () => switchPaintToolFromShortcut('eraser'));
+        events.on('paint.tool.eyedropper', () => switchPaintToolFromShortcut('eyedropper'));
+        events.on('paint.tool.decal', () => switchPaintToolFromShortcut('decal'));
         events.on('paint.tool.set', (toolName: PaintToolName) => {
             if (!['brush', 'eraser', 'eyedropper', 'decal'].includes(toolName)) return;
             if (activePaintTool === toolName) return;
-            if (strokeActive) cancelStroke();
+            if (strokeActive) cancelStroke('paint-tool-changed');
             if (parameterAdjustment) {
                 if (parent.hasPointerCapture(parameterAdjustment.pointerId)) {
                     parent.releasePointerCapture(parameterAdjustment.pointerId);
@@ -1667,7 +2194,7 @@ class PaintTool {
 
         events.on('scene.elementRemoved', (element: unknown) => {
             if (!(element instanceof Splat)) return;
-            if (element === strokeTarget) cancelStroke();
+            if (element === strokeTarget) cancelStroke('paint-target-removed');
             const runtime = this.runtimes.get(element);
             if (runtime) {
                 runtime.destroy();
@@ -1702,7 +2229,7 @@ class PaintTool {
                 parameterAdjustment = null;
                 updateAdjustmentCursor();
             }
-            if (strokeActive) cancelStroke();
+            if (strokeActive) cancelStroke('paint-tool-deactivated');
             svg.classList.add('hidden');
             decalCursor.classList.add('hidden');
             toolbar.hidden = true;

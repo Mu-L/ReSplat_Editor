@@ -17,6 +17,7 @@ const {
     accumulatePaintLayerRgba,
     blendModeRgb,
     blendPaintLayerRgb,
+    compositePaintAlpha,
     compositePaintLayerRgb,
     erasePaintLayerRgba
 } = await import(moduleUrl);
@@ -75,6 +76,9 @@ layer = accumulatePaintLayerRgba(layer, blueHalf);
 assertRgbClose(layer, [0.25, 0, 0.5, 0.75]);
 const layerSource = [layer[0] / layer[3], layer[1] / layer[3], layer[2] / layer[3]];
 assertRgbClose(compositePaintLayerRgb(baseline, layerSource, layer[3], 'normal', 0.5), [0.125, 0, 0.25]);
+assert.equal(compositePaintAlpha(0, 0.5), 0.5);
+assert.equal(compositePaintAlpha(0.5, 0.5), 0.75);
+assert.equal(compositePaintAlpha(0.5, 0.5, 0.5), 0.625);
 
 // Erasing scales premultiplied color and alpha together, revealing lower
 // layers without tinting or otherwise modifying their pixels.

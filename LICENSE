@@ -443,3 +443,24 @@ preserved below as required by their respective licenses.
    Fan, Andrew Feng.
    Full license text: src/nanogs/LICENSE-NANOGS.txt
    https://creativecommons.org/licenses/by-nc/4.0/
+
+4. Segment Anything 2 (SAM 2)
+   https://github.com/facebookresearch/sam2
+   Segment Select uses the SAM 2 model architecture and weights.
+   Licensed under the Apache License 2.0.
+   Copyright (c) Meta Platforms, Inc. and affiliates.
+   Full license text: src/segment-selection/LICENSE-APACHE-2.0.txt
+
+5. Segment Anything 2 ONNX Models / samexporter
+   https://huggingface.co/vietanhdev/segment-anything-2-onnx-models
+   https://github.com/vietanhdev/samexporter
+   ReSplat bundles the pinned SAM2 Hiera Tiny ONNX encoder and decoder
+   exported by this project. Licensed under Apache License 2.0.
+   Copyright (c) Viet-Anh Nguyen.
+   Full license text: src/segment-selection/LICENSE-APACHE-2.0.txt
+
+6. ONNX Runtime Web
+   https://github.com/microsoft/onnxruntime
+   Used for local WebGPU/WASM model inference. Licensed under the MIT
+   License. Copyright (c) Microsoft Corporation. The MIT license text
+   reproduced above also applies to this component.

@@ -154,6 +154,11 @@ const compositePaintLayerRgb = (
     ].map(clamp01) as Rgb;
 };
 
+const compositePaintAlpha = (backdropAlpha: number, sourceAlpha: number, opacity = 1) => {
+    const effectiveAlpha = clamp01(sourceAlpha) * clamp01(opacity);
+    return effectiveAlpha + clamp01(backdropAlpha) * (1 - effectiveAlpha);
+};
+
 const accumulatePaintLayerRgba = (
     current: PremultipliedRgba,
     sample: ArrayLike<number>,
@@ -202,6 +207,7 @@ export {
     accumulatePaintLayerRgba,
     blendModeRgb,
     blendPaintLayerRgb,
+    compositePaintAlpha,
     compositePaintLayerRgb,
     erasePaintLayerRgba,
     isPaintBlendMode

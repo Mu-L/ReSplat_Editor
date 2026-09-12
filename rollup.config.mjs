@@ -59,6 +59,7 @@ const application = {
                 { src: 'static/images', dest: 'static' },
                 { src: 'static/icons', dest: 'static' },
                 { src: 'static/lib', dest: 'static' },
+                { src: 'static/models', dest: 'static' },
                 { src: 'static/locales', dest: 'static' },
                 { src: 'static/luts', dest: 'static' },
                 { src: 'static/audio', dest: 'static' },
@@ -75,12 +76,28 @@ const application = {
                 // WorkerQueue.workerUrl to ./worker.mjs.
                 // NOTE: source is dist/worker.mjs (lib/ has only webp.wasm).
                 { src: 'node_modules/@playcanvas/splat-transform/dist/worker.mjs' },
+                // ONNX Runtime Web's WebGPU bundle uses the asyncify WASM build.
+                // sam2-runtime.ts points wasmPaths at this stable app-relative
+                // directory so browser, PWA and app:// builds resolve equally.
+                {
+                    src: 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs',
+                    dest: 'static/lib/onnxruntime'
+                },
+                {
+                    src: 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm',
+                    dest: 'static/lib/onnxruntime'
+                },
                 // NanoGS CC BY-NC 4.0 license + attribution + project CC BY 4.0
                 // license (incl. third-party notices) — copied into dist/ so the
                 // license texts ship with the software (web dist/ and the
                 // packaged app asar both include dist/**).
                 { src: 'src/nanogs/LICENSE-NANOGS.txt', dest: 'licenses' },
                 { src: 'src/nanogs/README.md', dest: 'licenses' },
+                {
+                    src: 'src/segment-selection/LICENSE-APACHE-2.0.txt',
+                    dest: 'licenses',
+                    destFilename: 'LICENSE-SAM2-APACHE-2.0.txt'
+                },
                 { src: 'LICENSE', dest: 'licenses', destFilename: 'LICENSE.txt' }
             ]
         }),
