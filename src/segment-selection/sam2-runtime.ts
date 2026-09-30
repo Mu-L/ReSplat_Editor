@@ -6,7 +6,13 @@ import {
     type MaskCandidateSelectionOptions,
     type SegmentPrediction
 } from './mask-utils';
-import { SAM2_INPUT_SIZE, SAM2_MASK_INPUT_SIZE, SAM2_TINY_MODEL, type Sam2ModelFile } from './sam2-config';
+import {
+    getSam2ModelUrls,
+    SAM2_INPUT_SIZE,
+    SAM2_MASK_INPUT_SIZE,
+    SAM2_TINY_MODEL,
+    type Sam2ModelFile
+} from './sam2-config';
 import {
     normalizedPointsToModel,
     prepareSam2Image,
@@ -88,13 +94,27 @@ class Sam2Runtime {
 
     private async fetchModel(file: Sam2ModelFile) {
         this.emit({ stage: 'loading', file: file.label });
-        const url = new URL(file.url, document.baseURI);
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`Failed to load bundled ${file.label} model (${response.status})`);
+        // GitHub repositories reject files over 100 MiB, so the 128 MiB encoder
+        // cannot live in a branch-backed Pages deployment. Prefer the pinned
+        // upstream artifact there; desktop and self-hosted builds stay local.
+        const failures: string[] = [];
 
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        await this.verifyModel(file, bytes);
-        return bytes;
+        for (const url of getSam2ModelUrls(file, document.baseURI)) {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    failures.push(`${url.host}: HTTP ${response.status}`);
+                    continue;
+                }
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                await this.verifyModel(file, bytes);
+                return bytes;
+            } catch (error) {
+                failures.push(`${url.host}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+
+        throw new Error(`Failed to load ${file.label} model (${failures.join('; ')})`);
     }
 
     private async releaseSessions() {

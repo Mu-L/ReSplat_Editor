@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<!-- Root hosting entry. Build the browser app with `npm run build` first. -->
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>ReSplat</title>
+        <base href="./dist/" />
+        <link rel="manifest" href="./manifest.json" />
+        <link rel="stylesheet" href="./index.css" />
+    </head>
+    <body>
+        <div id="file-protocol-help" style="display:none;font:16px sans-serif;padding:32px;line-height:1.8">
+            请通过 HTTP 服务打开 ReSplat。开发环境请在项目目录运行
+            <code>npm run develop</code>，然后访问 <code>http://localhost:3000</code>。
+        </div>
+        <script>
+            if (window.location.protocol === 'file:') {
+                document.getElementById('file-protocol-help').style.display = 'block';
+            }
+        </script>
+        <script type="module" src="./index.js"></script>
+    </body>
+</html>

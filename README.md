@@ -122,7 +122,7 @@ ReSplat 重构了原版的选择球与选择盒，并新增了阻挡平面，三
 - 快捷键 `6`，支持新建、添加、移除和细化选区
 - 2D 模式分割当前视图；3D 模式采集当前及左右两个视图并按 Gaussian ID 求交
 - 优先使用 WebGPU，设备不支持时自动回退 ONNX Runtime Web WASM
-- 网页构建和桌面安装包均内置约 148 MiB 的 SAM2 Hiera Tiny encoder/decoder，不在使用时连接第三方模型站点
+- 桌面安装包和自托管网页构建内置约 148 MiB 的 SAM2 Hiera Tiny encoder/decoder；受 GitHub 100 MiB 单文件限制，GitHub Pages 版本首次使用时从锁定版本的 Hugging Face 模型源下载 encoder
 - 推理完全在本机完成，场景截图、点击位置和 Gaussian 数据不会上传
 
 模型来源：[vietanhdev/segment-anything-2-onnx-models](https://huggingface.co/vietanhdev/segment-anything-2-onnx-models)。第三方许可与固定模型版本见 [LICENSE](./LICENSE) 和 `src/segment-selection/sam2-config.ts`。

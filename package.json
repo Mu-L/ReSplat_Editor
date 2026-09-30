@@ -1,6 +1,6 @@
 {
     "name": "ReSplat",
-    "version": "2.0.1",
+    "version": "2.0.2",
     "main": "electron/main.cjs",
     "author": "Re祁",
     "homepage": "https://playcanvas.com/ReSplat/editor",
