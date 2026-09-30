@@ -4,6 +4,7 @@ import { Mat4, Vec3 } from 'playcanvas';
 import { DataPanel } from './data-panel';
 import { Events } from '../events';
 import { AboutPopup } from './about-popup';
+import { setupBottomToolbarStack } from './bottom-toolbar-stack';
 import { CameraModeSwitch } from './camera-mode-switch';
 import { CombineLcc2Popup } from './combine-lcc2-popup';
 import { DownloadPopup } from './download-popup';
@@ -324,6 +325,7 @@ class EditorUI {
 
         document.body.appendChild(appContainer.dom);
         document.body.setAttribute('tabIndex', '-1');
+        setupBottomToolbarStack(canvasContainer.dom);
 
         events.on('show.shortcuts', () => {
             shortcutsPopup.hidden = false;

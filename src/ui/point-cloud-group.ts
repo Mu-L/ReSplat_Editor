@@ -557,6 +557,16 @@ class PointCloudGroup extends Container {
         this.groupItems = [];
         const splatGroups = this.groups.filter(g => g.splat === splat);
 
+        // Undoing group creation removes the data before this list is rebuilt.
+        // Reconcile the active selection as well, otherwise its toolbar remains
+        // visible with buttons targeting a group that no longer exists.
+        if (this.selectedGroupData && !splatGroups.includes(this.selectedGroupData)) {
+            this.setSelectedGroupData(null);
+            this._activeGroup = false;
+            this._needsGaussianSelection = false;
+            this.events.fire('splat.stateChanged', splat);
+        }
+
         // 清理已不存在（被删除或属于其他 splat）的独显/编辑组
         const staleSplats = new Set<Splat>();
         for (const gd of Array.from(this.soloedGroups)) {

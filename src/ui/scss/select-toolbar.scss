@@ -3,7 +3,7 @@
 .select-toolbar {
     position: absolute;
     left: 50%;
-    bottom: 100px;
+    bottom: calc(100px + var(--bottom-toolbar-stack-offset, 0px));
     height: 54px;
     transform: translate(-50%, 0);
     padding: 0px 8px;
